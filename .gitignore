@@ -1,0 +1,23 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Data files
+data/positions.json
+data/trades.db
+data/runtime_settings.json
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
