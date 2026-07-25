@@ -203,7 +203,14 @@ class PositionManager:
         self.wins = 0
         self.losses = 0
         # Monotonic counter for naming peak-cluster baskets ("Box 1", "Box 2"...).
+        # LEGACY: kept only so OLD saved state still loads. Real numbering now
+        # uses per-strategy counters below, so peak_cluster / peaker_cool_basket /
+        # peaker_warm_basket each get their OWN "Box N" sequence (they used to
+        # SHARE one counter -- a cool basket would steal the cluster's next
+        # number, the "box 1,2,3" bug). Cross-strategy uniqueness is handled by
+        # grouping on (strategy, box) wherever the label is consumed.
         self.cluster_box_seq = 0
+        self.cluster_box_seqs: Dict[str, int] = {}
         # Optional callback invoked after a position is closed/resolved (set by
         # the dashboard to route Telegram close/resolution alerts). The hook
         # skips reason=='manual' (flip/thesis exits notify directly, otherwise
@@ -659,20 +666,26 @@ class PositionManager:
     def get_redeemable_positions(self) -> List[TrackedPosition]:
         return [p for p in self.positions if p.redeemable and p.status in ('open', 'won')]
 
-    # === Peak-cluster basket numbering ("Box 1", "Box 2", ...) ===
-    def peek_cluster_box(self) -> str:
-        """Label for the NEXT basket WITHOUT consuming the number."""
-        return f"Box {self.cluster_box_seq + 1}"
+    # === Per-strategy basket numbering ("Box 1", "Box 2", ...) ===
+    # Each basket strategy keeps its OWN counter, so peak_cluster,
+    # peaker_cool_basket and peaker_warm_basket number independently. The stored
+    # label stays "Box N" (clean); cross-strategy uniqueness is handled by
+    # grouping on (strategy, box) wherever the label is consumed.
+    def peek_cluster_box(self, strategy: str = 'peak_cluster') -> str:
+        """Label for this strategy's NEXT basket WITHOUT consuming the number."""
+        return f"Box {self.cluster_box_seqs.get(strategy, 0) + 1}"
 
-    def commit_cluster_box(self) -> str:
-        """Consume + persist the next basket number; returns its label."""
-        self.cluster_box_seq += 1
+    def commit_cluster_box(self, strategy: str = 'peak_cluster') -> str:
+        """Consume + persist this strategy's next basket number; return label."""
+        n = self.cluster_box_seqs.get(strategy, 0) + 1
+        self.cluster_box_seqs[strategy] = n
+        self.cluster_box_seq = max(self.cluster_box_seq, n)  # keep legacy field sane
         self._save_state()
-        return f"Box {self.cluster_box_seq}"
+        return f"Box {n}"
 
-    def next_cluster_box(self) -> str:
+    def next_cluster_box(self, strategy: str = 'peak_cluster') -> str:
         """Back-compat convenience: peek + commit."""
-        return self.commit_cluster_box()
+        return self.commit_cluster_box(strategy)
 
     def reset_fresh(self, starting_balance: float = None):
         """RESTART FRESH — clear ALL positions and reset the paper balance to a
@@ -692,6 +705,7 @@ class PositionManager:
         self.wins = 0
         self.losses = 0
         self.cluster_box_seq = 0
+        self.cluster_box_seqs = {}
         self._announced_cluster_close = set()
         # Persist a customised starting balance so it survives the reset.
         try:
@@ -904,7 +918,7 @@ class PositionManager:
         if reason not in DASHBOARD_NOTIFIED_REASONS:
             box = getattr(pos, 'cluster_box', '') or ''
             if box and getattr(pos, 'strategy', '') in BASKET_STRATEGIES:
-                self._maybe_notify_cluster_close(box)
+                self._maybe_notify_cluster_close(box, getattr(pos, 'strategy', ''))
             elif getattr(self, '_notify_close', None):
                 try:
                     self._notify_close(pos)
@@ -916,24 +930,28 @@ class PositionManager:
     # RESOLUTION & REDEMPTION
     # ============================
 
-    def _maybe_notify_cluster_close(self, box: str):
+    def _maybe_notify_cluster_close(self, box: str, strategy: str = ''):
         """Once ALL legs of a basket ("Box N") have resolved, emit ONE grouped
-        resolution summary via the wired callback. Fires only once per box
-        (de-duped through `_announced_cluster_close`). Covers peak_cluster AND
-        peaker cool/warm baskets."""
+        resolution summary via the wired callback. Fires only once per
+        (strategy, box) (de-duped through `_announced_cluster_close`). Keyed by
+        strategy too, so a peak_cluster "Box 1" and a peaker_cool_basket "Box 1"
+        (independent per-strategy counters) are NEVER merged. Covers peak_cluster
+        AND peaker cool/warm baskets."""
         if not box:
             return
         legs = [p for p in self.positions
                 if (getattr(p, 'cluster_box', '') or '') == box
-                and getattr(p, 'strategy', '') in BASKET_STRATEGIES]
+                and getattr(p, 'strategy', '') in BASKET_STRATEGIES
+                and (not strategy or getattr(p, 'strategy', '') == strategy)]
         if not legs:
             return
         # Hold the summary until no leg is still open/pending.
         if any(l.status in ('open', 'pending') for l in legs):
             return
-        if box in self._announced_cluster_close:
+        key = (strategy, box)
+        if key in self._announced_cluster_close:
             return
-        self._announced_cluster_close.add(box)
+        self._announced_cluster_close.add(key)
         cb = getattr(self, '_notify_cluster_close', None)
         if cb:
             try:
@@ -1538,6 +1556,7 @@ class PositionManager:
                 'wins': self.wins,
                 'losses': self.losses,
                 'cluster_box_seq': self.cluster_box_seq,
+                'cluster_box_seqs': self.cluster_box_seqs,
                 'positions': [self._pos_to_dict(p) for p in self.positions[-500:]],
                 'market_contexts': {
                     k: {'slug': v.slug, 'city': v.city, 'active': v.active,
@@ -1588,6 +1607,7 @@ class PositionManager:
             self.wins = state.get('wins', 0)
             self.losses = state.get('losses', 0)
             self.cluster_box_seq = state.get('cluster_box_seq', 0)
+            self.cluster_box_seqs = dict(state.get('cluster_box_seqs', {}) or {})
             for pd in state.get('positions', []):
                 try:
                     pos = TrackedPosition(
@@ -1632,6 +1652,19 @@ class PositionManager:
                     self.positions.append(pos)
                 except Exception:
                     continue
+            # Seed per-strategy box counters from existing positions when loading
+            # OLD state (pre per-strategy counters) so a restart never reissues a
+            # "Box N" a strategy is already using.
+            if not self.cluster_box_seqs:
+                import re as _re_box
+                _seeded: Dict[str, int] = {}
+                for _p in self.positions:
+                    _st = getattr(_p, 'strategy', '') or ''
+                    _bx = getattr(_p, 'cluster_box', '') or ''
+                    _m = _re_box.search(r'(\d+)', _bx)
+                    if _st in BASKET_STRATEGIES and _m:
+                        _seeded[_st] = max(_seeded.get(_st, 0), int(_m.group(1)))
+                self.cluster_box_seqs = _seeded
             log.info(f"Loaded {len(self.positions)} positions")
         except Exception as e:
             log.debug(f"No state: {e}")

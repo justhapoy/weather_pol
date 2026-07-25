@@ -166,12 +166,16 @@ class WeatherBot:
             self.pm.check_risk_triggers()  # stop-loss / take-profit
             flip_exits = exit_policies.check_flip_exits(self.pm)    # quick_flip +10%/-5% + ML upside
             cap_exits = exit_policies.check_profit_caps(self.pm)    # Req-30: global 300% ML-managed cap
+            # LIQUIDITY SWEEP first: cut a broken non-basket thesis fast at -50%
+            # into available liquidity (primary cut; runs BEFORE thesis-exit so
+            # -85% is only a deeper backstop). Baskets exempt.
+            sweep_exits = exit_policies.check_liquidity_sweep_exits(self.pm)
             thesis_exits = exit_policies.check_thesis_exits(self.pm)  # strict thesis-invalidation (very bad only)
             ml_review_exits = exit_policies.check_ml_reviews(self.pm)  # Req-31: ML early HOLD/SELL position review
-            # Flip/cap/thesis/ml-review closes pass their real reason into
+            # Flip/cap/sweep/thesis/ml-review closes pass their real reason into
             # _close_position; the PM _notify_close hook skips those reasons
             # (DASHBOARD_NOTIFIED_REASONS) so they are notified ONCE here.
-            for _p in (flip_exits or []) + (cap_exits or []) + (thesis_exits or []) + (ml_review_exits or []):
+            for _p in (flip_exits or []) + (cap_exits or []) + (sweep_exits or []) + (thesis_exits or []) + (ml_review_exits or []):
                 try:
                     self.telegram.notify_close(_p)
                 except Exception as e:
@@ -396,9 +400,18 @@ class WeatherBot:
             return True, 'ok'
         if count_as_buy and self._scan_buys >= int(getattr(Config, 'MAX_BUYS_PER_SCAN', 6)):
             return False, f"max {Config.MAX_BUYS_PER_SCAN} buys/scan reached"
+        # Effective cash reserve = the LARGER of the % portfolio reserve and the
+        # absolute-dollar floor BALANCE_RESERVE_USD (a hard $ floor the bot never
+        # trades below, independent of portfolio size). 0 disables the floor.
         reserve = pv * float(getattr(Config, 'PORTFOLIO_RESERVE_PCT', 0.15))
+        _dollar_floor = float(getattr(Config, 'BALANCE_RESERVE_USD', 0.0) or 0.0)
+        reserve = max(reserve, _dollar_floor)
         if balance - size_usd < reserve:
-            return False, f"would breach {Config.PORTFOLIO_RESERVE_PCT:.0%} cash reserve (${reserve:.2f})"
+            _pct = float(getattr(Config, 'PORTFOLIO_RESERVE_PCT', 0.15))
+            _why = ('${:.2f} balance floor'.format(_dollar_floor)
+                    if _dollar_floor >= pv * _pct
+                    else '{:.0%} cash reserve'.format(_pct))
+            return False, f"would breach {_why} (${reserve:.2f})"
         deployed = pv - balance
         if deployed + size_usd > pv * float(getattr(Config, 'PORTFOLIO_MAX_DEPLOY_PCT', 0.85)):
             return False, f"would exceed {Config.PORTFOLIO_MAX_DEPLOY_PCT:.0%} deployed cap"
@@ -1061,11 +1074,24 @@ class WeatherBot:
             # as an unbroken temperature ladder around the peak (fill/keep the
             # interior neighbours, never a probability-gapped hole). Gapped
             # baskets are the proven loss source; a too-short run is dropped.
-            try:
-                from overlay import cluster_contiguous as _cc
-                cluster_signals = _cc.enforce_all(cluster_signals, market_prices, token_ids)
-            except Exception as _e:
-                log.debug(f"cluster contiguity overlay skipped: {_e}")
+            # peak_cluster-ONLY basket shaping (never touches the peaker baskets):
+            #   * CONTIGUOUS: rebuild as an unbroken ladder around the peak.
+            #   * PROB_BASED (opt-in): also pull in any window bucket with model
+            #     prob >= PEAK_CLUSTER_PROB_MIN that fits the cost cap -- catches a
+            #     high-prob non-adjacent winner the contiguous run would skip.
+            if getattr(Config, 'PEAK_CLUSTER_CONTIGUOUS_ENABLED', True):
+                try:
+                    from overlay import cluster_contiguous as _cc
+                    cluster_signals = _cc.enforce_all(cluster_signals, market_prices, token_ids)
+                except Exception as _e:
+                    log.debug(f"cluster contiguity overlay skipped: {_e}")
+            if getattr(Config, 'PEAK_CLUSTER_PROB_BASED_ENABLED', False):
+                try:
+                    from overlay import cluster_probfill as _cp
+                    cluster_signals = _cp.augment_all(
+                        cluster_signals, bucket_probs, market_prices, token_ids)
+                except Exception as _e:
+                    log.debug(f"cluster prob-fill overlay skipped: {_e}")
             for sig in cluster_signals:
                 self.signals_generated += 1
                 # ATOMIC basket (Req-28): a cluster is all-or-none. Filter to
@@ -1088,7 +1114,7 @@ class WeatherBot:
                     continue
                 # Reserve the next box label for this basket (peek; commit only
                 # if at least one leg actually fills).
-                box_label = self.pm.peek_cluster_box()
+                box_label = self.pm.peek_cluster_box('peak_cluster')
                 log.info(f"   🧺 CLUSTER {city} [{box_label}] | {len(cl_legs)} legs | {sig.reason}")
                 placed_legs = []
                 for leg in cl_legs:
@@ -1122,7 +1148,7 @@ class WeatherBot:
                         placed_legs.append(pos)
                 if placed_legs:
                     # Consume the box number and tag every placed leg with it.
-                    committed = self.pm.commit_cluster_box()
+                    committed = self.pm.commit_cluster_box('peak_cluster')
                     for lp in placed_legs:
                         lp.cluster_box = committed
                     # Whole basket = ONE buy toward the per-scan budget.
@@ -1191,7 +1217,7 @@ class WeatherBot:
                     continue
                 # A multi-leg basket groups under a shared cluster box so the UI
                 # and PM render/resolve it as ONE unit (same as peak_cluster).
-                box_label = self.pm.peek_cluster_box() if is_basket else ''
+                box_label = self.pm.peek_cluster_box(sig.sub_strategy) if is_basket else ''
                 pk_edge = sig.combined_prob - sig.total_cost
                 placed_peaker = []
                 for leg in pk_legs:
@@ -1233,7 +1259,7 @@ class WeatherBot:
                         # Group as ONE unit: tag every leg with the box, persist,
                         # and send ONE grouped Telegram alert labelled e.g.
                         # "peaker cool basket".
-                        committed = self.pm.commit_cluster_box()
+                        committed = self.pm.commit_cluster_box(sig.sub_strategy)
                         for lp in placed_peaker:
                             lp.cluster_box = committed
                         try:
@@ -1358,7 +1384,7 @@ class WeatherBot:
         deployed = stats['portfolio_value'] - stats['balance']
         log.info(f"  💰 deployed ${deployed:.2f} across {len(open_pos)} pos | free ${stats['balance']:.2f} "
                  f"| this scan: {self._scan_buys} buys / ${self._scan_deployed_usd:.2f}")
-        log.info(f"{'─'*60}")
+        log.info(f"{'��'*60}")
 
         if open_pos:
             log.info(f"  FILLED POSITIONS:")

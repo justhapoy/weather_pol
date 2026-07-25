@@ -64,6 +64,18 @@ def _pid(pos):
             or f"{getattr(pos, 'city', '')}:{getattr(pos, 'bucket_label', '')}")
 
 
+def _num(pos, *names):
+    """First present numeric attribute among names, else 0.0. Never raises."""
+    for n in names:
+        try:
+            v = getattr(pos, n, None)
+            if v is not None:
+                return round(float(v), 6)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
 def _append(path, row):
     try:
         os.makedirs("data", exist_ok=True)
@@ -112,7 +124,15 @@ def observe(pos):
         t = {"entry": entry, "min_price": price, "max_price": price,
              "mae_pct": roi, "mfe_pct": roi,
              "crossed": {"-20": False, "-30": False, "-50": False},
-             "strategy": getattr(pos, "strategy", ""), "city": getattr(pos, "city", "")}
+             "strategy": getattr(pos, "strategy", ""), "city": getattr(pos, "city", ""),
+             # decision context captured ONCE at entry -> enables what-if research
+             "signal": getattr(pos, "signal", "") or "",
+             "bucket": getattr(pos, "bucket_label", "") or "",
+             "edge": _num(pos, "edge_at_entry", "edge"),
+             "grade": _num(pos, "grade"),
+             "prob": _num(pos, "our_probability", "prob_win", "p_win"),
+             "cost_usd": _num(pos, "cost_basis", "cost_usd", "cost"),
+             "shares": _num(pos, "shares")}
         _TRACK[pid] = t
     if price < t["min_price"]:
         t["min_price"] = price
@@ -156,6 +176,11 @@ def finalize(pos):
             "exit_price": round(float(getattr(pos, "exit_price", 0.0) or 0.0), 4),
             "realized_pnl": round(float(getattr(pos, "realized_pnl", 0.0) or 0.0), 4),
             "final_status": getattr(pos, "status", ""),
+            # decision context (captured at entry) for what-if backtests
+            "signal": t.get("signal", ""), "bucket": t.get("bucket", ""),
+            "edge": t.get("edge", 0.0), "grade": t.get("grade", 0.0),
+            "prob": t.get("prob", 0.0), "cost_usd": t.get("cost_usd", 0.0),
+            "shares": t.get("shares", 0.0),
         })
     except Exception:
         pass

@@ -101,6 +101,19 @@ class Config:
     # API calls; keep within the daily budget.
     WEATHER_FORECAST_CACHE_SECONDS = int(os.getenv('WEATHER_FORECAST_CACHE_SECONDS', '300'))
 
+    # Open-Meteo model members (comma-sep, highest confidence first). Default now
+    # leads with ECMWF IFS *HRES* (`ecmwf_ifs`, native ~9 km, finest + freshest,
+    # real-time) then IFS 0.25 (`ecmwf_ifs025`), the GFS/ICON/JMA/GEM seamless
+    # members, and finally the old 0.4 deg `ecmwf_ifs04` kept ONLY as a fallback
+    # member (it is the coarsest ECMWF grid and frequently returns all-null; the
+    # null-tolerant parser simply skips it when empty). HRES carries no 2m
+    # relative humidity field -> that column may be null for the HRES member,
+    # which the null-tolerant helpers already handle; temperature is solid.
+    OPEN_METEO_MODELS = [m.strip() for m in os.getenv(
+        'OPEN_METEO_MODELS',
+        'ecmwf_ifs,ecmwf_ifs025,gfs_seamless,icon_seamless,jma_seamless,gem_seamless,ecmwf_ifs04'
+    ).split(',') if m.strip()]
+
     # ===================================================================
     # WEATHER-API FAILOVER (Req-25 fix #5) - survive Open-Meteo rate / IP limits.
     # When the primary forecast provider returns a rate/IP-limit response
@@ -128,6 +141,26 @@ class Config:
     # is evaluated for buys; this single choke point protects EVERY strategy.
     WEATHER_BUY_GUARD_ENABLED = os.getenv('WEATHER_BUY_GUARD_ENABLED', '1') == '1'
     WEATHER_MIN_FORECAST_MODELS = int(os.getenv('WEATHER_MIN_FORECAST_MODELS', '1'))
+
+    # LAST-GOOD OBSERVED CACHE (overlay in data/observed_weather.py). Remembers
+    # the highest observed extreme (high mode) / lowest (low mode) seen so far
+    # today per city, and (1) CLAMPS a fresh read so a glitchy LOWER value can
+    # never weaken a lock we already earned, and (2) bridges a momentary
+    # Open-Meteo starvation (fresh=None) with the last-good value so a
+    # near-certain trade is not missed. It can ONLY raise (high) / lower (low)
+    # the extreme -> it can never manufacture false confidence. TTL bounds
+    # staleness within the local day (key already includes the date).
+    OBSERVED_CACHE_ENABLED = os.getenv('OBSERVED_CACHE_ENABLED', '1') == '1'
+    OBSERVED_CACHE_TTL_SECONDS = int(os.getenv('OBSERVED_CACHE_TTL_SECONDS', '10800'))  # 3h
+
+    # WEATHER TRACE / HEALTH WATCHER (overlay/weather_trace.py). Fail-open,
+    # append-only JSONL side-car that records, per decision, exactly which
+    # weather data drove it: per-source point counts + peak temp (provider
+    # agreement), the observed lock state (locked vs starved, spread, hours
+    # left, models with data vs null, which source produced the used number),
+    # city/market/strategy/timestamp. Purely observational (never changes a
+    # decision); shipped in /exportdata and summarised by /weatherhealth.
+    WEATHER_TRACE_ENABLED = os.getenv('WEATHER_TRACE_ENABLED', '1') == '1'
 
     # ===================================================================
     # TRADING PARAMETERS
@@ -206,6 +239,10 @@ class Config:
     # for the good markets that appear later in the same scan.
     PORTFOLIO_GUARD_ENABLED = os.getenv('PORTFOLIO_GUARD_ENABLED', '1') == '1'
     PORTFOLIO_RESERVE_PCT = float(os.getenv('PORTFOLIO_RESERVE_PCT', '0.15'))  # always keep >= this % of portfolio in cash
+    # Absolute-dollar cash floor: the bot never trades the balance below this
+    # many dollars. Effective reserve = max(PORTFOLIO_RESERVE_PCT * portfolio,
+    # BALANCE_RESERVE_USD). 0 = disabled (percentage reserve only).
+    BALANCE_RESERVE_USD = float(os.getenv('BALANCE_RESERVE_USD', '0.0'))
     PORTFOLIO_MAX_DEPLOY_PCT = float(os.getenv('PORTFOLIO_MAX_DEPLOY_PCT', '0.85'))  # never deploy beyond this % of portfolio
     MAX_DEPLOY_PER_SCAN_PCT = float(os.getenv('MAX_DEPLOY_PER_SCAN_PCT', '0.30'))  # new $ per scan <= this % of portfolio
     MAX_BUYS_PER_SCAN = int(os.getenv('MAX_BUYS_PER_SCAN', '6'))               # max NEW buys placed in one scan
@@ -274,6 +311,12 @@ class Config:
     LATE_OBSERVED_MIN_ENTRY_PRICE = float(os.getenv('LATE_OBSERVED_MIN_ENTRY_PRICE', '0.02'))
     LATE_OBSERVED_NO_MIN_PRICE = float(os.getenv('LATE_OBSERVED_NO_MIN_PRICE', '0.04'))
     LATE_OBSERVED_NO_MAX_PRICE = float(os.getenv('LATE_OBSERVED_NO_MAX_PRICE', '0.97'))
+    # entry-band gate (overlay) -- data-driven profitable price windows
+    LATE_OBS_YES_MIN_ENTRY = float(os.getenv('LATE_OBS_YES_MIN_ENTRY', '0.20'))
+    LATE_OBS_YES_MAX_ENTRY = float(os.getenv('LATE_OBS_YES_MAX_ENTRY', '0.50'))
+    LATE_OBS_NO_MIN_ENTRY = float(os.getenv('LATE_OBS_NO_MIN_ENTRY', '0.50'))
+    LATE_OBS_NO_MAX_ENTRY = float(os.getenv('LATE_OBS_NO_MAX_ENTRY', '0.97'))
+    ENTRY_BAND_GATE_ENABLED = os.getenv('ENTRY_BAND_GATE_ENABLED', 'true').lower() == 'true'
     LATE_OBSERVED_BASE_FRACTION = float(os.getenv('LATE_OBSERVED_BASE_FRACTION', '0.06'))
     LATE_OBSERVED_MAX_FRACTION = float(os.getenv('LATE_OBSERVED_MAX_FRACTION', '0.25'))
     LATE_OBSERVED_MAX_LEGS = int(os.getenv('LATE_OBSERVED_MAX_LEGS', '4'))
@@ -396,7 +439,14 @@ class Config:
     # let it settle (ride to resolution) per spec.
     # ===================================================================
     PROFIT_CAP_ENABLED = os.getenv('PROFIT_CAP_ENABLED', '1') == '1'
-    PROFIT_CAP_ROI_PCT = float(os.getenv('PROFIT_CAP_ROI_PCT', '300.0'))                 # ML-managed ceiling on unrealized ROI%
+    PROFIT_CAP_ROI_PCT = float(os.getenv('PROFIT_CAP_ROI_PCT', '300.0'))                 # ROI% ceiling (set 350 in Telegram if you want)
+    # DETERMINISTIC by default: at the cap the position is BOOKED instantly to
+    # LOCK the gain (fixes "350% cap never fired" round-trips). Applies to normal
+    # singles incl. late_observed_no (harmless safety net -- NO tops out ~100% ROI
+    # so it never actually fires) and late_observed_yes (books the round-trippers).
+    # Baskets stay EXEMPT via PROFIT_CAP_EXEMPT_BASKETS. Flip ON to instead hand
+    # capped winners to the ML, which may ride them past the cap.
+    PROFIT_CAP_ML_OVERRIDE = os.getenv('PROFIT_CAP_ML_OVERRIDE', '0') == '1'
 
     # ===================================================================
     # PEAK_CLUSTER - parallel any-one-wins basket. Estimate the peak bucket
@@ -407,7 +457,7 @@ class Config:
     # ===================================================================
     PEAK_CLUSTER_ENABLED = os.getenv('PEAK_CLUSTER_ENABLED', '1') == '1'
     PEAK_CLUSTER_SPAN = int(os.getenv('PEAK_CLUSTER_SPAN', '3'))                          # +/- buckets around the estimated peak
-    PEAK_CLUSTER_MAX_COST = float(os.getenv('PEAK_CLUSTER_MAX_COST', '0.97'))             # combined per-share cost ceiling
+    PEAK_CLUSTER_MAX_COST = float(os.getenv('PEAK_CLUSTER_MAX_COST', '0.95'))             # combined per-share cost ceiling (the <95c mispricing gate: any single winning leg pays $1 > basket cost, covering the losers + profit)
     PEAK_CLUSTER_MIN_LEGS = int(os.getenv('PEAK_CLUSTER_MIN_LEGS', '3'))                  # minimum legs for a valid basket (never a 1-leg cluster)
     PEAK_CLUSTER_MAX_LEGS = int(os.getenv('PEAK_CLUSTER_MAX_LEGS', '7'))                  # 3-7 neighbouring buckets per the design
     PEAK_CLUSTER_MIN_EDGE = float(os.getenv('PEAK_CLUSTER_MIN_EDGE', '0.03'))             # combined prob - cost minimum
@@ -417,6 +467,14 @@ class Config:
     PEAK_CLUSTER_MAX_FRACTION = float(os.getenv('PEAK_CLUSTER_MAX_FRACTION', '0.20'))     # max % of balance per basket
     PEAK_CLUSTER_MAX_USD = float(os.getenv('PEAK_CLUSTER_MAX_USD', '15.0'))               # hard $ cap per basket
     PEAK_CLUSTER_TRADE_DECIDED = os.getenv('PEAK_CLUSTER_TRADE_DECIDED', '0') == '1'      # run inside the lock window? off by default
+    # peak_cluster-ONLY selection toggles (never affect the peaker cool/warm
+    # baskets). CONTIGUOUS = rebuild the basket as an unbroken temperature ladder
+    # around the peak (proven winner, ON). PROB_BASED = also pull in any window
+    # bucket with model prob >= PEAK_CLUSTER_PROB_MIN even if non-adjacent, to
+    # catch a high-prob winner the contiguous run would skip (opt-in, OFF).
+    PEAK_CLUSTER_CONTIGUOUS_ENABLED = os.getenv('PEAK_CLUSTER_CONTIGUOUS_ENABLED', '1') == '1'
+    PEAK_CLUSTER_PROB_BASED_ENABLED = os.getenv('PEAK_CLUSTER_PROB_BASED_ENABLED', '1') == '1'
+    PEAK_CLUSTER_PROB_MIN = float(os.getenv('PEAK_CLUSTER_PROB_MIN', '0.10'))
 
     # ===================================================================
     # SAFETY PEAK - DEAD (merged into PEAKER). Knobs kept so old envs don't break.
@@ -486,6 +544,23 @@ class Config:
     THESIS_EXIT_MIN_ENTRY_PRICE = float(os.getenv('THESIS_EXIT_MIN_ENTRY_PRICE', '0.10')) # tails below this are HELD, never thesis-exited
     THESIS_EXIT_MIN_BID = float(os.getenv('THESIS_EXIT_MIN_BID', '0.02'))                 # need a real bid to exit into
     THESIS_EXIT_MIN_MINUTES_TO_CLOSE = float(os.getenv('THESIS_EXIT_MIN_MINUTES_TO_CLOSE', '60.0'))  # near-close positions are HELD
+
+    # ===================================================================
+    # LIQUIDITY-SWEEP EXIT (trading/exit_policies.check_liquidity_sweep_exits).
+    # When a NON-basket position's thesis breaks and ROI collapses to <= -50%,
+    # cut it FAST at the best immediately-available liquidity instead of letting
+    # it bleed to -90%+. Evidence from the ledger: only ~4% of positions recover
+    # once they hit -50% (so cutting there is correct), while ~43% recover at
+    # -20% (so we deliberately do NOT cut early on noise). Baskets are EXEMPT
+    # (any-one-wins structures ride to settlement, same as the thesis/profit-cap
+    # exits). Fires earlier than THESIS_EXIT (-85%) so it is the primary cut.
+    # ===================================================================
+    LIQ_SWEEP_EXIT_ENABLED = os.getenv('LIQ_SWEEP_EXIT_ENABLED', '1') == '1'
+    LIQ_SWEEP_TRIGGER_ROI_PCT = float(os.getenv('LIQ_SWEEP_TRIGGER_ROI_PCT', '-50.0'))    # cut at/below this ROI (thesis broken)
+    LIQ_SWEEP_MIN_ENTRY_PRICE = float(os.getenv('LIQ_SWEEP_MIN_ENTRY_PRICE', '0.10'))     # tails below this are HELD (lottery legs)
+    LIQ_SWEEP_MIN_BID = float(os.getenv('LIQ_SWEEP_MIN_BID', '0.02'))                     # need a real bid to sweep into
+    LIQ_SWEEP_MIN_MINUTES_TO_CLOSE = float(os.getenv('LIQ_SWEEP_MIN_MINUTES_TO_CLOSE', '30.0'))  # near-close positions are HELD (settle)
+    LIQ_SWEEP_EXEMPT_BASKETS = os.getenv('LIQ_SWEEP_EXEMPT_BASKETS', '1') == '1'          # baskets ride to settlement
 
     # ===================================================================
     # OUTCOME-DECIDED GATE - only HARD-skip a market once its measurement day is

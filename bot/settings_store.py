@@ -47,12 +47,19 @@ BOOL_KEYS = [
     'QUICK_FLIP_BOOK_OR_CUT', 'QUICK_FLIP_USE_ML_PROFIT',
     'QUICK_FLIP_HARD_STOP_ENABLED',
     # global ML profit cap
-    'PROFIT_CAP_ENABLED',
+    'PROFIT_CAP_ENABLED', 'PROFIT_CAP_ML_OVERRIDE',
     # peaker / cluster behaviour
     'PEAKER_PREFER_COOL', 'PEAKER_TRADE_DECIDED', 'PEAK_CLUSTER_TRADE_DECIDED',
+    'PEAK_CLUSTER_CONTIGUOUS_ENABLED', 'PEAK_CLUSTER_PROB_BASED_ENABLED',
     # exits / liquidity / gating
     'THESIS_EXIT_ENABLED', 'LIQUIDITY_GUARD_ENABLED', 'LIQUIDITY_STRICT_BLOCK',
     'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS',
+    # entry-band gate + research data capture (overlays)
+    'ENTRY_BAND_GATE_ENABLED', 'MAE_MFE_LOGGING_ENABLED',
+    # weather overlays: last-good observed cache + health watcher
+    'OBSERVED_CACHE_ENABLED', 'WEATHER_TRACE_ENABLED',
+    # liquidity-sweep exit (fast cut at -50% into available liquidity)
+    'LIQ_SWEEP_EXIT_ENABLED', 'LIQ_SWEEP_EXEMPT_BASKETS',
 ]
 
 # -- Numeric gates: key -> (min, max, step, is_int) ---------------------
@@ -89,6 +96,11 @@ NUM_KEYS: Dict[str, tuple] = {
     'LATE_OBSERVED_EDGE_FULL':     (0.05, 0.50, 0.05, False),
     'LATE_OBSERVED_NO_MIN_PRICE':  (0.01, 0.20, 0.01, False),
     'LATE_OBSERVED_NO_MAX_PRICE':  (0.80, 0.99, 0.01, False),
+    # entry-band gate (overlay) -- data-driven profitable price windows
+    'LATE_OBS_YES_MIN_ENTRY':      (0.01, 0.90, 0.01, False),
+    'LATE_OBS_YES_MAX_ENTRY':      (0.05, 0.95, 0.05, False),
+    'LATE_OBS_NO_MIN_ENTRY':       (0.01, 0.95, 0.01, False),
+    'LATE_OBS_NO_MAX_ENTRY':       (0.50, 0.99, 0.01, False),
     # quick-flip
     'QUICK_FLIP_MIN_EDGE':         (0.00, 0.40, 0.02, False),
     'QUICK_FLIP_MAX_PER_MARKET':   (1, 5, 1, True),
@@ -128,8 +140,17 @@ NUM_KEYS: Dict[str, tuple] = {
     'PEAK_CLUSTER_MIN_CONF':       (0.00, 1.00, 0.05, False),
     'PEAK_CLUSTER_MAX_CENTER_PRICE': (0.50, 0.99, 0.05, False),
     'PEAK_CLUSTER_MAX_USD':        (3, 50, 1, False),
+    # weather overlays
+    'OBSERVED_CACHE_TTL_SECONDS':  (900, 43200, 900, True),
+    # liquidity-sweep exit
+    'LIQ_SWEEP_TRIGGER_ROI_PCT':   (-90, -20, 5, False),
+    'LIQ_SWEEP_MIN_ENTRY_PRICE':   (0.01, 0.50, 0.01, False),
+    'LIQ_SWEEP_MIN_BID':           (0.01, 0.20, 0.01, False),
+    'LIQ_SWEEP_MIN_MINUTES_TO_CLOSE': (0, 240, 15, False),
     # exits & liquidity
     'PROFIT_CAP_ROI_PCT':          (100, 1000, 25, False),
+    'BALANCE_RESERVE_USD':         (0, 1000000, 5, False),
+    'PEAK_CLUSTER_PROB_MIN':       (0.01, 0.50, 0.01, False),
     'THESIS_EXIT_MAX_ROI_PCT':     (-99, -50, 5, False),
     'TRAILING_STOP_PCT':           (5, 90, 5, False),
     'TRAILING_MIN_PEAK_MULT':      (1.0, 10.0, 0.5, False),
@@ -184,7 +205,7 @@ GROUPS: List[dict] = [
         'KELLY_TIER_VGOOD_USD', 'KELLY_TIER_PERFECT_USD',
         'PORTFOLIO_RESERVE_PCT', 'MAX_DEPLOY_PER_SCAN_PCT', 'MAX_BUYS_PER_SCAN',
         'MAX_DAILY_DRAWDOWN_PCT', 'MAX_WEEKLY_DRAWDOWN_PCT', 'DRAWDOWN_COOLDOWN_MINUTES',
-        'MIN_EDGE_TO_ENTER', 'GRADE_MIN_TO_TRADE',
+        'MIN_EDGE_TO_ENTER', 'GRADE_MIN_TO_TRADE', 'BALANCE_RESERVE_USD',
     ]},
     {'id': 'lateobs', 'tab': 'LateObs', 'title': 'Late-Observed (primary)', 'keys': [
         'LATE_OBSERVED_NO_SIDE',
@@ -193,6 +214,15 @@ GROUPS: List[dict] = [
         'LATE_OBSERVED_MAX_LEGS', 'LATE_OBSERVED_SIZE_FLOOR_USD',
         'LATE_OBSERVED_SIZE_MAX_USD', 'LATE_OBSERVED_EDGE_FULL',
         'LATE_OBSERVED_NO_MIN_PRICE', 'LATE_OBSERVED_NO_MAX_PRICE',
+    ]},
+    {'id': 'entry', 'tab': 'Entry', 'title': 'Entry Bands (price gates)', 'keys': [
+        'ENTRY_BAND_GATE_ENABLED',
+        'LATE_OBS_YES_MIN_ENTRY', 'LATE_OBS_YES_MAX_ENTRY',
+        'LATE_OBS_NO_MIN_ENTRY', 'LATE_OBS_NO_MAX_ENTRY',
+    ]},
+    {'id': 'weather', 'tab': 'Weather', 'title': 'Weather Data & Health', 'keys': [
+        'OBSERVED_CACHE_ENABLED', 'OBSERVED_CACHE_TTL_SECONDS',
+        'WEATHER_TRACE_ENABLED',
     ]},
     {'id': 'quickflip', 'tab': 'Flip', 'title': 'Quick-Flip', 'keys': [
         'QUICK_FLIP_PROFIT_ONLY_EXIT', 'QUICK_FLIP_USE_ML_EXIT',
@@ -218,12 +248,18 @@ GROUPS: List[dict] = [
         'PEAK_CLUSTER_SPAN', 'PEAK_CLUSTER_MIN_LEGS', 'PEAK_CLUSTER_MAX_LEGS',
         'PEAK_CLUSTER_MAX_COST', 'PEAK_CLUSTER_MIN_EDGE', 'PEAK_CLUSTER_MIN_CONF',
         'PEAK_CLUSTER_MAX_CENTER_PRICE', 'PEAK_CLUSTER_MAX_USD',
+        'PEAK_CLUSTER_CONTIGUOUS_ENABLED', 'PEAK_CLUSTER_PROB_BASED_ENABLED',
+        'PEAK_CLUSTER_PROB_MIN',
     ]},
     {'id': 'exits', 'tab': 'Exits', 'title': 'Exits & Liquidity', 'keys': [
         'THESIS_EXIT_ENABLED', 'LIQUIDITY_GUARD_ENABLED', 'LIQUIDITY_STRICT_BLOCK',
         'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS', 'PROFIT_CAP_ENABLED',
+        'PROFIT_CAP_ML_OVERRIDE',
         'THESIS_EXIT_MAX_ROI_PCT', 'PROFIT_CAP_ROI_PCT', 'TRAILING_STOP_PCT', 'TRAILING_MIN_PEAK_MULT',
         'EARLY_PROFIT_THRESHOLD', 'LIQUIDITY_THIN_SIZE_MULT', 'HIGH_TEMP_LOCK_HOUR',
+        # liquidity-sweep exit (fast cut at -50% into available liquidity)
+        'LIQ_SWEEP_EXIT_ENABLED', 'LIQ_SWEEP_EXEMPT_BASKETS', 'LIQ_SWEEP_TRIGGER_ROI_PCT',
+        'LIQ_SWEEP_MIN_ENTRY_PRICE', 'LIQ_SWEEP_MIN_BID', 'LIQ_SWEEP_MIN_MINUTES_TO_CLOSE',
     ]},
     {'id': 'sniper', 'tab': 'Sniper', 'title': 'Sniper / Basket', 'keys': [
         'SNIPER_MIN_GRADE', 'SNIPER_MIN_CONFIDENCE', 'SNIPER_MIN_PROBABILITY',

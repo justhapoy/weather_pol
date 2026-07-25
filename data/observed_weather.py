@@ -67,8 +67,74 @@ except Exception:  # pragma: no cover - fallback only used in bare sandboxes
     log = logging.getLogger("observed_weather")
 
 # Open-Meteo forecast models we average for a remaining-hours spread estimate.
-_DEFAULT_MODELS = ("ecmwf_ifs04", "gfs_seamless", "icon_seamless", "jma_seamless", "gem_seamless")
+# Leads with ECMWF IFS HRES (`ecmwf_ifs`, ~9 km native, finest+freshest) + IFS
+# 0.25, so the lock path benefits from the sharpest ECMWF data (C8). Config can
+# override via OPEN_METEO_MODELS; the old 0.4 deg `ecmwf_ifs04` is kept LAST as a
+# fallback member only (often all-null -> the null-tolerant parser skips it).
+_DEFAULT_MODELS = ("ecmwf_ifs", "ecmwf_ifs025", "gfs_seamless", "icon_seamless",
+                   "jma_seamless", "gem_seamless", "ecmwf_ifs04")
 _OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+
+
+# ── LAST-GOOD OBSERVED CACHE (C7) ──────────────────────────────────────────
+# The day's extreme can never un-happen, so a cached observed value is a hard
+# floor (high mode) / ceiling (low mode). Two jobs: (1) clamp a fresh read so a
+# glitchy LOWER value can never weaken a lock we already earned; (2) bridge a
+# momentary Open-Meteo starvation with the last-good value so a near-certain
+# trade is not missed. It can ONLY raise (high) / lower (low) the extreme, so it
+# can never manufacture false confidence. Keyed per (lat, lon, local-date, mode)
+# so it resets every local day; TTL bounds intra-day staleness.
+_OBS_CACHE: Dict[tuple, Tuple[float, float]] = {}
+
+
+def _obs_cache_enabled() -> bool:
+    c = _config()
+    return bool(getattr(c, "OBSERVED_CACHE_ENABLED", True)) if c is not None else True
+
+
+def _obs_cache_ttl() -> int:
+    c = _config()
+    return int(getattr(c, "OBSERVED_CACHE_TTL_SECONDS", 10800)) if c is not None else 10800
+
+
+def _obs_cache_get(key):
+    rec = _OBS_CACHE.get(key)
+    if not rec:
+        return None
+    ts, val = rec
+    if time.time() - ts > _obs_cache_ttl():
+        _OBS_CACHE.pop(key, None)
+        return None
+    return val
+
+
+def _obs_cache_merge(key, value, mode):
+    """Store & return the up-only (high) / down-only (low) merged extreme."""
+    prev = _obs_cache_get(key)
+    if prev is None:
+        merged = float(value)
+    else:
+        merged = max(prev, float(value)) if mode == "high" else min(prev, float(value))
+    _OBS_CACHE[key] = (time.time(), merged)
+    return merged
+
+
+def _trace_starved(lat, lon, target_day, mode, n_models_total):
+    """WATCHER (fail-open): record a pure starvation event (no data, no cache
+    bridge) so /weatherhealth and the export can show which cities/positions
+    got NO usable weather at decision time. Never raises into the hot path.
+    """
+    try:
+        from overlay import weather_trace as _wt
+        _wt.record_observed(
+            lat=lat, lon=lon, target_day=str(target_day), mode=mode,
+            observed_extreme=None, current_temp=None, remaining_spread=None,
+            hours_remaining=None, n_models_with_data=0,
+            n_models_total=int(n_models_total or 0),
+            is_locked=False, used_cache=False, starved=True,
+        )
+    except Exception:
+        pass
 
 
 def _config():
@@ -378,6 +444,7 @@ class ObservedWeather:
                 f"   \U0001f319 observed fetch returned no data @ {lat:.2f},{lon:.2f} "
                 f"(history source AND multi-model source both failed)"
             )
+            _trace_starved(lat, lon, measurement_date, mode, 0)
             return None
         if not obs_data:
             log.info(
@@ -400,6 +467,7 @@ class ObservedWeather:
                 f"   \U0001f319 observed: response had no temperature_2m hourly series "
                 f"@ {lat:.2f},{lon:.2f}"
             )
+            _trace_starved(lat, lon, target_day, mode, len(self.models))
             return None
 
         s0 = obs_series[0]
@@ -413,6 +481,27 @@ class ObservedWeather:
             else:
                 observed_extreme = (max(observed_extreme, current_temp)
                                     if mode == "high" else min(observed_extreme, current_temp))
+
+        # LAST-GOOD OBSERVED CACHE (C7): clamp a fresh read up-only(high)/
+        # down-only(low) so a glitchy lower value can't weaken an earned lock,
+        # and bridge a momentary starvation (fresh=None) with the last-good
+        # value so a near-certain trade is not missed. Never lowers a high /
+        # raises a low -> can never manufacture false confidence.
+        ckey = (round(lat, 2), round(lon, 2), str(target_day), mode)
+        used_cache = False
+        if _obs_cache_enabled():
+            if observed_extreme is not None:
+                observed_extreme = _obs_cache_merge(ckey, observed_extreme, mode)
+            else:
+                cached = _obs_cache_get(ckey)
+                if cached is not None:
+                    observed_extreme = cached
+                    used_cache = True
+                    log.info(
+                        f"   \U0001f5d2\ufe0f  observed: fresh read starved @ {lat:.2f},{lon:.2f} "
+                        f"— using last-good cached {mode} extreme {cached:.1f}°C "
+                        f"(cache bridges the gap; never lowers a high/raises a low)"
+                    )
 
         if observed_extreme is None:
             log.info(
@@ -441,7 +530,7 @@ class ObservedWeather:
             remaining_extreme = None
             remaining_spread = 0.0
 
-        return ObservedDayState(
+        state = ObservedDayState(
             observed_extreme_c=observed_extreme,
             remaining_extreme_c=remaining_extreme,
             remaining_spread_c=remaining_spread,
@@ -451,3 +540,18 @@ class ObservedWeather:
             mode=mode,
             as_of_local=now_local.isoformat(timespec="minutes"),
         )
+        # WATCHER (fail-open, zero core impact): record exactly which weather
+        # data drove this lock decision. n_models_with_data vs total surfaces
+        # silent members; used_cache flags a bridged read.
+        try:
+            from overlay import weather_trace as _wt
+            _wt.record_observed(
+                lat=lat, lon=lon, target_day=str(target_day), mode=mode,
+                observed_extreme=observed_extreme, current_temp=current_temp,
+                remaining_spread=remaining_spread, hours_remaining=hours_remaining,
+                n_models_with_data=len(per_model_remaining), n_models_total=len(s_series),
+                is_locked=state.is_locked, used_cache=used_cache, starved=False,
+            )
+        except Exception:
+            pass
+        return state

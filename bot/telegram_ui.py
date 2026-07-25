@@ -796,37 +796,99 @@ class TelegramBot:
             log.debug(f"csv write failed: {e}")
             return None
 
-    def send_analysis(self):
-        """/analysis — full strategy performance breakdown + a downloadable log
-        of every BUY / SELL / SETTLE / REDEEM / exit.
+    def _mae_mfe_path(self) -> str:
+        return getattr(Config, 'MAE_MFE_SUMMARY_PATH', 'data/positions_mae_mfe.jsonl')
 
-        Live W/L/PnL come from the PositionManager (thesis exits ARE counted as
-        losses — see PositionManager._closed_outcome), and per-strategy BUY
-        counts + action/exit tallies come from data/paper_trades.jsonl.
+    def send_data_export(self):
+        """/exportdata -- ship the side-car RESEARCH dataset (per-position price
+        path + decision context + outcome) as downloadable JSONL + CSV. This is
+        the lightweight, parallel data capture: it never touches the core hot
+        path, and answers what-if questions like 'late_no only @ 0.35 -> profit?'.
+        Read-only and fully defensive."""
+        if not self.enabled:
+            return
+        path = self._mae_mfe_path()
+        recs = []
+        try:
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            recs.append(json.loads(line))
+                        except Exception:
+                            continue
+        except Exception as e:
+            log.debug(f"data export read failed: {e}")
+        if not recs:
+            self.send("�� No research data captured yet — it builds as positions close "
+                      "(side-car logger, zero core impact). Try again after some trades settle.")
+            return
+        cols = ['t', 'id', 'strategy', 'city', 'bucket', 'signal', 'entry', 'edge',
+                'grade', 'prob', 'cost_usd', 'shares', 'min_price', 'max_price',
+                'mae_pct', 'mfe_pct', 'crossed_-20', 'crossed_-30', 'crossed_-50',
+                'exit_reason', 'exit_price', 'realized_pnl', 'final_status']
+        csv_path = (path[:-6] + '.csv') if path.endswith('.jsonl') else (path + '.csv')
+        try:
+            os.makedirs(os.path.dirname(csv_path) or '.', exist_ok=True)
+            with open(csv_path, 'w', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(cols)
+                for r in recs:
+                    cr = r.get('crossed', {}) or {}
+                    w.writerow([
+                        r.get('t', ''), r.get('id', ''), r.get('strategy', ''),
+                        r.get('city', ''), r.get('bucket', ''), r.get('signal', ''),
+                        r.get('entry', ''), r.get('edge', ''), r.get('grade', ''),
+                        r.get('prob', ''), r.get('cost_usd', ''), r.get('shares', ''),
+                        r.get('min_price', ''), r.get('max_price', ''), r.get('mae_pct', ''),
+                        r.get('mfe_pct', ''), cr.get('-20', ''), cr.get('-30', ''),
+                        cr.get('-50', ''), r.get('exit_reason', ''), r.get('exit_price', ''),
+                        r.get('realized_pnl', ''), r.get('final_status', ''),
+                    ])
+        except Exception as e:
+            log.debug(f"data export csv failed: {e}")
+            csv_path = None
+        self.send(
+            f"📊 <b>Research dataset</b> — {len(recs)} closed positions with full "
+            f"price-path (MAE/MFE + dip crossings) and decision context "
+            f"(entry, edge, grade, prob, size). Use it for what-if backtests."
+        )
+        self._send_document(path, caption=f"positions_mae_mfe.jsonl ({len(recs)} rows)")
+        if csv_path:
+            self._send_document(csv_path, caption="positions_mae_mfe.csv")
+        # WEATHER TRACE (watcher side-car): ship the raw per-decision weather
+        # health log too, so what-if analysis can join outcomes to the exact
+        # weather data (per-model null/data, provider agreement, cache/starve).
+        try:
+            from overlay import weather_trace as _wt
+            wt_path = _wt.trace_path()
+            _wt.flush()
+            if os.path.exists(wt_path) and os.path.getsize(wt_path) > 0:
+                n = sum(1 for _ in open(wt_path))
+                self._send_document(wt_path, caption=f"weather_trace.jsonl ({n} events)")
+        except Exception as e:
+            log.debug(f"weather_trace export skipped: {e}")
+
+    def send_analysis(self):
+        """/analysis -- clean strategy performance + HOW positions closed
+        (counts, W/L, realized PnL per exit type) + downloadable CSVs.
+
+        Everything is computed from the PositionManager (authoritative), so the
+        W/L and PnL shown here MATCH the position ledger (the raw log tally could
+        double-count across restarts -- that was the "pnl error"/messy exits).
+        The raw trade log CSV and the per-position MAE/MFE path CSV are attached.
         """
         if not self.pm:
-            self.send("⚠️ Analysis unavailable — position manager not wired.")
+            self.send("\u26A0\uFE0F Analysis unavailable -- position manager not wired.")
             return
         stats = self.pm.get_stats()
         by_strat = self.pm.get_per_strategy_stats()
-        recs = self._read_trade_log()
-
-        # Tally actions + per-strategy BUY counts + exit reasons from the log.
-        action_counts: Dict[str, int] = {}
-        buys_by_strat: Dict[str, int] = {}
-        exit_counts: Dict[str, int] = {}
-        for r in recs:
-            a = r.get('action', '') or '?'
-            action_counts[a] = action_counts.get(a, 0) + 1
-            if a == 'BUY':
-                s = r.get('strategy', '?') or '?'
-                buys_by_strat[s] = buys_by_strat.get(s, 0) + 1
-            if a in ('SELL', 'SETTLE'):
-                xr = r.get('exit_reason', '') or '—'
-                exit_counts[xr] = exit_counts.get(xr, 0) + 1
 
         text = (
-            f"📈 <b>Strategy Analysis</b> — {stats['mode']}\n"
+            f"\U0001F4C8 <b>Strategy Analysis</b> -- {stats['mode']}\n"
             f"Balance ${stats['balance']:.2f} | PnL ${stats['total_pnl']:+.2f} "
             f"({stats['roi_pct']:+.1f}%)\n"
             f"WR {stats['win_rate']:.0f}% ({stats['wins']}W/{stats['losses']}L) | "
@@ -835,7 +897,7 @@ class TelegramBot:
             f"Positions value ${stats.get('position_value', 0.0):.2f} | "
             f"Portfolio ${stats['portfolio_value']:.2f}\n"
             f"{'-'*28}\n"
-            f"<b>By strategy</b> (buys · W/L · WR · PnL)\n"
+            f"<b>By strategy</b> (closed W/L \u00B7 WR \u00B7 realized PnL)\n"
         )
         text += self._outcome_breakdown_text()
         if not by_strat:
@@ -845,44 +907,100 @@ class TelegramBot:
                                    key=lambda kv: kv[1]['pnl'], reverse=True):
                 closed = s['wins'] + s['losses']
                 wr = (s['wins'] / closed * 100.0) if closed else 0.0
-                buys = buys_by_strat.get(strat, s['trades'])
-                pe = '🟢' if s['pnl'] >= 0 else '🔴'
+                pe = '\U0001F7E2' if s['pnl'] >= 0 else '\U0001F534'
                 text += (
-                    f"{pe} <b>{self._esc(strat)}</b>: {buys} buys · "
-                    f"{s['wins']}W/{s['losses']}L · {wr:.0f}% · ${s['pnl']:+.2f}\n"
+                    f"{pe} <b>{self._esc(strat)}</b>: {s['trades']} pos \u00B7 "
+                    f"{s['wins']}W/{s['losses']}L \u00B7 {wr:.0f}% \u00B7 ${s['pnl']:+.2f}\n"
                 )
 
-        if action_counts:
-            text += f"{'-'*28}\n<b>Log actions</b>: "
-            text += " · ".join(f"{self._esc(k)} {v}"
-                                for k, v in sorted(action_counts.items()))
-            text += "\n"
-        if exit_counts:
-            text += "<b>Exits</b>: "
-            text += " · ".join(f"{self._esc(k)} {v}" for k, v in
-                                sorted(exit_counts.items(), key=lambda kv: -kv[1]))
-            text += "\n"
+        # HOW POSITIONS CLOSED -- grouped by canonical exit from the PM ledger
+        # (source of truth) so counts + realized PnL are consistent. Plain labels.
+        exit_groups: Dict[str, dict] = {}
+        for p in self.pm.positions:
+            if getattr(p, 'status', '') == 'open':
+                continue
+            lbl = self._close_label(p)
+            g = exit_groups.setdefault(lbl, {'n': 0, 'pnl': 0.0, 'w': 0, 'l': 0})
+            g['n'] += 1
+            g['pnl'] += (getattr(p, 'pnl', 0.0) or 0.0)
+            oc = self.pm._closed_outcome(p)
+            if oc == 'win':
+                g['w'] += 1
+            elif oc == 'loss':
+                g['l'] += 1
+        text += f"{'-'*28}\n<b>How positions closed</b>\n"
+        if not exit_groups:
+            text += "  (nothing closed yet)\n"
+        else:
+            tot_n = sum(g['n'] for g in exit_groups.values())
+            tot_pnl = sum(g['pnl'] for g in exit_groups.values())
+            for lbl, g in sorted(exit_groups.items(),
+                                 key=lambda kv: kv[1]['pnl'], reverse=True):
+                pe = '\U0001F7E2' if g['pnl'] >= 0 else '\U0001F534'
+                text += (f"  {pe} {self._esc(lbl)}: {g['n']} closed \u00B7 "
+                         f"{g['w']}W/{g['l']}L \u00B7 ${g['pnl']:+.2f}\n")
+            text += f"  <b>\u03A3 {tot_n} closed \u00B7 ${tot_pnl:+.2f} realized</b>\n"
 
         self.send(text)
 
-        # Attach a tidy CSV (buys/sells/exits/profits) as the downloadable; fall
-        # back to the raw JSONL if the CSV can't be written.
+        # Downloadables: (1) tidy trades CSV, (2) per-position MAE/MFE path CSV.
+        recs = self._read_trade_log()
         if recs:
             csv_path = self._write_trades_csv(recs)
             if csv_path:
                 self._send_document(
                     csv_path,
-                    caption=(f"📎 Trades CSV — {len(recs)} rows "
+                    caption=(f"\U0001F4CE Trades CSV -- {len(recs)} rows "
                              f"(buys / sells / exits / profits)"),
                 )
             else:
                 self._send_document(
                     self._trade_log_path(),
-                    caption=(f"📎 Full trade log — {len(recs)} records "
-                             f"(BUY/SELL/SETTLE/REDEEM/exits)"),
+                    caption=(f"\U0001F4CE Full trade log -- {len(recs)} records"),
                 )
         else:
-            self.send("ℹ️ No trade-log records yet — the log is empty.")
+            self.send("\u2139\uFE0F No trade-log records yet -- the log is empty.")
+        mm_csv = self._jsonl_to_csv('data/positions_mae_mfe.jsonl')
+        if mm_csv:
+            self._send_document(
+                mm_csv,
+                caption="\U0001F4CE MAE/MFE per-position -- worst/best ROI vs "
+                        "realized (shows round-trips: peaks that gave gains back)")
+
+    def _jsonl_to_csv(self, jsonl_path: str):
+        """Flatten a JSONL file to a CSV next to it; return CSV path or None.
+        Columns = union of keys across rows (stable first-seen order)."""
+        try:
+            if not os.path.exists(jsonl_path):
+                return None
+            rows = []
+            with open(jsonl_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        continue
+            if not rows:
+                return None
+            cols = []
+            for r in rows:
+                for k in r.keys():
+                    if k not in cols:
+                        cols.append(k)
+            out = (jsonl_path[:-6] if jsonl_path.endswith('.jsonl')
+                   else jsonl_path) + '.csv'
+            with open(out, 'w', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=cols, extrasaction='ignore')
+                w.writeheader()
+                for r in rows:
+                    w.writerow({k: r.get(k, '') for k in cols})
+            return out
+        except Exception as e:
+            log.debug(f"jsonl->csv failed: {e}")
+            return None
 
     # ==============================================================
     # MANUAL CLOSE (/close) — list open positions with a Sell button
@@ -985,19 +1103,34 @@ class TelegramBot:
         if st == 'lost':
             return '❌ lost (settled)'
         return {
-            'take_profit': '🎯 take-profit',
-            'stop_loss': '🛑 stop-loss',
-            'trailing_stop': '📉 trailing-stop',
-            'flip_timeout': '⏲️ flip book/cut',
-            'thesis_invalidated': '🚫 thesis-exit',
-            'manual': '🔴 manual sell',
-        }.get(reason, '🔴 sold')
+            'take_profit': '\U0001F3AF take-profit',
+            'stop_loss': '\U0001F6D1 stop-loss',
+            'trailing_stop': '\U0001F4C9 trailing-stop',
+            'flip_book': '\U0001F4B5 flip booked',
+            'flip_book_mid': '\U0001F4B5 flip booked',
+            'flip_stop': '\U0001F6D1 flip stop',
+            'flip_timeout': '\u23F2\uFE0F flip book/cut',
+            'thesis_invalidated': '\U0001F6AB thesis-exit',
+            'profit_cap_book': '\U0001F9E2 profit-cap booked',
+            'ml_review_sell': '\U0001F916 ML review sell',
+            'manual': '\U0001F534 manual sell',
+        }.get(reason, '\U0001F534 sold')
 
-    def _done_closed_view(self, page: int = 0):
-        """Build (text, keyboard) for a page of CLOSED positions — when bought,
-        when/how closed, and the per-symbol profit/loss."""
-        closed = ([p for p in self.pm.positions if p.status != 'open']
-                  if self.pm else [])
+    def _done_closed_view(self, page: int = 0, strat: str = 'all'):
+        """Build (text, keyboard) for a page of CLOSED positions -- when bought,
+        when/how closed, per-position P/L -- with per-strategy filter chips so
+        you can see exactly which positions closed for one strategy."""
+        all_closed = ([p for p in self.pm.positions if p.status != 'open']
+                      if self.pm else [])
+        strat_set = []
+        for p in all_closed:
+            s = getattr(p, 'strategy', '') or '\u2014'
+            if s not in strat_set:
+                strat_set.append(s)
+        strat_set.sort()
+        closed = (all_closed if strat == 'all'
+                  else [p for p in all_closed
+                        if (getattr(p, 'strategy', '') or '\u2014') == strat])
         closed.sort(key=lambda p: getattr(p, 'exit_time', None) or p.entry_time,
                     reverse=True)
         total = len(closed)
@@ -1008,35 +1141,62 @@ class TelegramBot:
         wins = sum(1 for p in closed if self.pm._closed_outcome(p) == 'win')
         losses = sum(1 for p in closed if self.pm._closed_outcome(p) == 'loss')
         realized = sum((p.pnl or 0.0) for p in closed)
-        text = (f"📕 <b>Closed positions</b> ({total}) — "
+        filt = '' if strat == 'all' else f" \u00B7 {self._esc(strat)}"
+        text = (f"\U0001F4D5 <b>Closed positions</b> ({total}{filt}) -- "
                 f"{wins}W/{losses}L | realized ${realized:+.2f}\n\n")
         if not chunk:
-            text += "No closed positions yet.\n"
+            text += "No closed positions in this view.\n"
         for p in chunk:
             val = p.pnl or 0.0
-            pe = '✅' if val > 0 else ('❌' if val < 0 else '➖')
+            pe = '\u2705' if val > 0 else ('\u274C' if val < 0 else '\u2796')
             bought = p.entry_time.strftime('%m-%d %H:%M') if p.entry_time else '?'
             closed_at = (p.exit_time.strftime('%m-%d %H:%M')
                          if getattr(p, 'exit_time', None) else '?')
             exit_px = p.exit_price if p.exit_price is not None else p.current_price
             name = self._esc(p.bucket_label or p.market_title)
+            box = getattr(p, 'cluster_box', '') or ''
+            box_s = f" [{self._esc(box)}]" if box else ''
             text += (
-                f"{pe} <b>{self._esc(p.city)}</b> {name} · {self._esc(p.strategy)}\n"
+                f"{pe} <b>{self._esc(p.city)}</b> {name} \u00B7 {self._esc(p.strategy)}{box_s}\n"
                 f"   {self._close_label(p)} | ${val:+.2f} ({p.roi_pct:+.0f}%)\n"
-                f"   bought {bought} @ ${p.entry_price:.3f} → "
+                f"   bought {bought} @ ${p.entry_price:.3f} -> "
                 f"closed {closed_at} @ ${exit_px:.3f} | {p.shares:.0f}sh\n"
             )
         nav = []
         if page > 0:
-            nav.append({'text': '⬅️ Prev',
-                        'callback_data': f"done:closed:{page-1}"})
+            nav.append({'text': '\u2B05\uFE0F Prev',
+                        'callback_data': f"done:closed:{page-1}:{strat}"})
         nav.append({'text': f"{page+1}/{pages}", 'callback_data': 'noop'})
         if page < pages - 1:
-            nav.append({'text': 'Next ➡️',
-                        'callback_data': f"done:closed:{page+1}"})
-        rows = [nav, [{'text': '📗 Open positions',
-                       'callback_data': 'done:open:0'}]]
+            nav.append({'text': 'Next \u27A1\uFE0F',
+                        'callback_data': f"done:closed:{page+1}:{strat}"})
+        rows = [nav]
+        def _chip(s, lbl):
+            return {'text': ('\u2022 ' if s == strat else '') + lbl,
+                    'callback_data': f"done:closed:0:{s}"}
+        chip_row = [_chip('all', '\U0001F310 All')]
+        for s in strat_set:
+            chip_row.append(_chip(s, self._short_strat(s)))
+            if len(chip_row) == 3:
+                rows.append(chip_row)
+                chip_row = []
+        if chip_row:
+            rows.append(chip_row)
+        rows.append([{'text': '\U0001F4D7 Open positions',
+                      'callback_data': 'done:open:0'}])
         return text, {'inline_keyboard': rows}
+
+    @staticmethod
+    def _short_strat(s: str) -> str:
+        return {
+            'late_observed_no': 'LateNo',
+            'late_observed_yes': 'LateYes',
+            'peak_cluster': 'Cluster',
+            'peaker_cool_basket': 'Cool',
+            'peaker_warm_basket': 'Warm',
+            'peaker': 'Peaker',
+            'quick_flip': 'Flip',
+        }.get(s, (s[:8] if s else '\u2014'))
 
     # ==============================================================
     # /aisummary — captured runtime warnings/errors
@@ -1241,6 +1401,10 @@ class TelegramBot:
         'ML_REVIEW_POSITIONS': 'ML Review-Pos',
         'ML_SELECT_MARKETS': 'ML Market-Pick',
         'AUTO_REDEEM_ENABLED': 'Auto-Redeem',
+        'PROFIT_CAP_ENABLED': 'Profit-Cap',
+        'PROFIT_CAP_ML_OVERRIDE': 'Cap ML-ride',
+        'PEAK_CLUSTER_CONTIGUOUS_ENABLED': 'Cluster contiguous',
+        'PEAK_CLUSTER_PROB_BASED_ENABLED': 'Cluster prob-based',
         'PORTFOLIO_GUARD_ENABLED': 'Port-Guard',
         'DRAWDOWN_GATE_ENABLED': 'Drawdown-Gate',
         'QUICK_FLIP_PROFIT_ONLY_EXIT': 'Flip profit-only',
@@ -1383,17 +1547,18 @@ class TelegramBot:
             self._do_manual_close(data.split(':', 1)[1], callback_id, message_id)
             return
 
-        # /done sub-views: "done:closed:<page>" | "done:open:<page>"
+        # /done sub-views: "done:closed:<page>[:<strat>]" | "done:open:<page>"
         if data.startswith('done:'):
+            parts = data.split(':')
+            which = parts[1] if len(parts) > 1 else 'closed'
             try:
-                _, which, pg_s = data.split(':')
-                pg = int(pg_s)
+                pg = int(parts[2]) if len(parts) > 2 else 0
             except (ValueError, IndexError):
-                self._answer_callback(callback_id)
-                return
+                pg = 0
+            strat = parts[3] if len(parts) > 3 else 'all'
             self._answer_callback(callback_id)
             if which == 'closed':
-                d_text, d_kb = self._done_closed_view(pg)
+                d_text, d_kb = self._done_closed_view(pg, strat)
                 self._edit(message_id, d_text, d_kb)
             else:
                 self.send_positions(page=pg, sort='pnl', with_summary=True,
@@ -1610,6 +1775,14 @@ class TelegramBot:
             self.send_markets_summary()
         elif cmd == '/analysis' or cmd == '/analyze' or cmd == '/report':
             self.send_analysis()
+        elif cmd in ('/exportdata', '/data', '/research'):
+            self.send_data_export()
+        elif cmd in ('/weatherhealth', '/weather', '/whealth'):
+            try:
+                from overlay import weather_trace as _wt
+                self.send(_wt.summarize())
+            except Exception as e:
+                self.send(f"\u26A0\uFE0F weather health unavailable: {e}")
         elif cmd in ('/close', '/sell'):
             self.send_close_menu()
         elif cmd in ('/done', '/history'):
@@ -1681,6 +1854,8 @@ class TelegramBot:
                 "/positions — open positions (10/page; sort by PnL/Losses/ROI/Recent)\n"
                 "/markets — active weather markets\n"
                 "/analysis — per-strategy performance + downloadable CSV\n"
+                "/exportdata — download research dataset (price paths + context) for what-if analysis\n"
+                "/weatherhealth — weather data health (locks, model spread, provider agreement, gaps)\n"
                 "/close — manually sell an open position (tap Sell)\n"
                 "/done — closed history + open positions (🟢/🔴)\n"
                 "/aisummary — recent runtime warnings/errors to share\n"

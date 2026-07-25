@@ -61,6 +61,13 @@ class WeatherFetcher:
 
     # ── API keys (Config attr first, then environment) ───────────────────
     @staticmethod
+    def _openweather_key() -> Optional[str]:
+        # Config attr OR environment, matching WeatherAPI/Visual Crossing. Fixes
+        # the gap where an OWM key set ONLY as a Railway env var (not on Config)
+        # was silently skipped, so OWM never joined the ensemble.
+        return getattr(Config, 'OPENWEATHER_API_KEY', None) or os.getenv('OPENWEATHER_API_KEY')
+
+    @staticmethod
     def _weatherapi_key() -> Optional[str]:
         return getattr(Config, 'WEATHERAPI_API_KEY', None) or os.getenv('WEATHERAPI_API_KEY')
 
@@ -180,7 +187,7 @@ class WeatherFetcher:
             log.warning(f"Open-Meteo fetch failed: {e}")
 
         # 2. OpenWeatherMap
-        if Config.OPENWEATHER_API_KEY:
+        if self._openweather_key():
             try:
                 ow_results = self._fetch_openweather(lat, lon, city, target_time)
                 results.extend(ow_results)
@@ -225,12 +232,30 @@ class WeatherFetcher:
         automatic failover to the next mirror when one is rate/IP limited.
         """
         results = []
-        models = ['ecmwf_ifs04', 'gfs_seamless', 'icon_seamless',
-                  'jma_seamless', 'gem_seamless']
+        # Model members are Config-driven (Config.OPEN_METEO_MODELS). Default now
+        # leads with ECMWF IFS HRES (`ecmwf_ifs`, ~9 km native, finest+freshest)
+        # then IFS 0.25, GFS/ICON/JMA/GEM, and the old `ecmwf_ifs04` LAST as a
+        # fallback member only (coarsest ECMWF grid; often all-null -> skipped).
+        models = list(getattr(Config, 'OPEN_METEO_MODELS', None) or
+                      ['ecmwf_ifs', 'ecmwf_ifs025', 'gfs_seamless',
+                       'icon_seamless', 'jma_seamless', 'gem_seamless', 'ecmwf_ifs04'])
+        # Per-member trust. HRES highest; the coarse/legacy 0.4 deg member lowest
+        # (it is a fallback only). Unknown members fall back to 0.70 below.
         model_confidence = {
-            'ecmwf_ifs04': 0.90, 'gfs_seamless': 0.80,
-            'icon_seamless': 0.82, 'jma_seamless': 0.78, 'gem_seamless': 0.75,
+            'ecmwf_ifs': 0.92, 'ecmwf_ifs025': 0.90, 'ecmwf_ifs04': 0.70,
+            'gfs_seamless': 0.80, 'icon_seamless': 0.82,
+            'jma_seamless': 0.78, 'gem_seamless': 0.75,
         }
+        # Clean display labels per member (else the ecmwf_ifs* ids collide).
+        model_label = {
+            'ecmwf_ifs': 'ECMWF-HRES', 'ecmwf_ifs025': 'ECMWF-025',
+            'ecmwf_ifs04': 'ECMWF-04', 'gfs_seamless': 'GFS',
+            'icon_seamless': 'ICON', 'jma_seamless': 'JMA', 'gem_seamless': 'GEM',
+        }
+        # NULL-MODEL GUARD: count points produced per member so we can log any
+        # member that returned an all-null series (e.g. ecmwf_ifs04 going dark)
+        # instead of silently dropping the highest-confidence forecast.
+        model_points = {m: 0 for m in models}
 
         params = {
             'latitude': lat,
@@ -297,7 +322,7 @@ class WeatherFetcher:
 
                     fp = ForecastPoint(
                         source='open_meteo',
-                        model=model.replace('_seamless', '').replace('_ifs04', '').upper(),
+                        model=model_label.get(model, model.upper()),
                         location=city or f"{lat},{lon}",
                         timestamp=t,
                         temp_c=temps[i],
@@ -310,8 +335,22 @@ class WeatherFetcher:
                         confidence=model_confidence.get(model, 0.7),
                     )
                     results.append(fp)
+                    model_points[model] = model_points.get(model, 0) + 1
         except Exception as e:
             log.debug(f"Open-Meteo batch failed: {e}")
+
+        # NULL-MODEL GUARD: surface any member that produced ZERO points so a
+        # silently-dark model (e.g. ecmwf_ifs04) is visible in the logs and the
+        # weather trace, and never mistaken for agreement.
+        missing = [model_label.get(m, m) for m, n in model_points.items() if n == 0]
+        if missing and any(n > 0 for n in model_points.values()):
+            log.info(f"   \U0001f9ea open-meteo null members @ {city or f'{lat},{lon}'}: "
+                     f"{', '.join(missing)} (returned no data — skipped, ensemble intact)")
+        try:
+            from overlay import weather_trace as _wt
+            _wt.record_fetch(city or f"{lat},{lon}", results, model_points, model_label)
+        except Exception:
+            pass
 
         return results
 
@@ -324,7 +363,7 @@ class WeatherFetcher:
         params = {
             'lat': lat,
             'lon': lon,
-            'appid': Config.OPENWEATHER_API_KEY,
+            'appid': self._openweather_key(),
             'units': 'metric',
         }
 

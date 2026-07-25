@@ -280,11 +280,23 @@ def check_profit_caps(pm):
         roi = pos.roi_pct
         if roi < cap:
             continue
+        # DETERMINISTIC by default: BOOK instantly at the cap to LOCK the gain
+        # (fixes the round-trip where a capped winner gave it all back). Flip
+        # PROFIT_CAP_ML_OVERRIDE ON to instead let the ML ride it past the cap.
+        # NOTE: baskets never reach here (exempted above); late_observed_no
+        # realistically never hits the cap (max ~100% ROI at $0.50 entry) so this
+        # is only a harmless safety net for it, per design.
+        if not _cfg('PROFIT_CAP_ML_OVERRIDE', False):
+            pm._close_position(pos, pos.current_price, 'profit_cap_book')
+            triggered.append(pos)
+            log.info(f"CAP BOOK (deterministic): {pos.city} {pos.bucket_label[:28]} "
+                     f"ROI={roi:+.0f}% @ ${pos.current_price:.4f} PnL=${pos.pnl:+.2f}")
+            continue
         d = _ml_profit(pos, 'cap')
         if str(d.get('action', 'HOLD')).upper() == 'BOOK':
             pm._close_position(pos, pos.current_price, 'profit_cap_book')
             triggered.append(pos)
-            log.info(f"CAP BOOK: {pos.city} {pos.bucket_label[:28]} "
+            log.info(f"CAP BOOK (ML): {pos.city} {pos.bucket_label[:28]} "
                      f"ROI={roi:+.0f}% @ ${pos.current_price:.4f} PnL=${pos.pnl:+.2f}")
         elif not getattr(pos, 'hold_to_resolution', False):
             pos.hold_to_resolution = True
@@ -296,6 +308,67 @@ def check_profit_caps(pm):
         pm._assert_ledger()
     elif changed:
         pm._save_state()
+    return triggered
+
+
+def check_liquidity_sweep_exits(pm):
+    """LIQUIDITY SWEEP: when a NON-basket thesis breaks and ROI collapses to
+    <= LIQ_SWEEP_TRIGGER_ROI_PCT (default -50%), cut it FAST at the best
+    immediately-available liquidity (pos.current_price = the live bid) instead
+    of letting it bleed toward -90%.
+
+    Why -50% and not -20%: the ledger shows ~43% of positions recover from -20%
+    (so cutting there throws away winners), but only ~4% recover from -50% (so
+    by then the thesis is genuinely gone and getting out fast beats riding it
+    down while liquidity evaporates). This fires EARLIER than THESIS_EXIT (-85%)
+    so it is the primary cut; thesis-exit remains as a deeper backstop.
+
+    Same guards + basket exemption as thesis-exit: baskets are any-one-wins
+    structures that ride to resolution, tails below min-entry are held, we need
+    a real bid to sweep into, and near-close positions are left to settle.
+    Reuses PositionManager._close_position so the ledger stays correct.
+    """
+    if not _cfg('LIQ_SWEEP_EXIT_ENABLED', True):
+        return []
+    trigger_roi = float(_cfg('LIQ_SWEEP_TRIGGER_ROI_PCT', -50.0))
+    min_entry = float(_cfg('LIQ_SWEEP_MIN_ENTRY_PRICE', 0.10))
+    min_bid = float(_cfg('LIQ_SWEEP_MIN_BID', 0.02))
+    min_mtc = float(_cfg('LIQ_SWEEP_MIN_MINUTES_TO_CLOSE', 30.0))
+    triggered = []
+    for pos in pm.get_open_positions():
+        # quick_flip has its own hard stop; don't double-manage it here.
+        if pos.strategy == 'quick_flip':
+            continue
+        # BASKET PROTECTION: peak_cluster + peaker cool/warm baskets are
+        # any-one-wins structures held to resolution (the single winning leg
+        # pays $1 and covers the losers). Never sweep a basket leg.
+        if _cfg('LIQ_SWEEP_EXEMPT_BASKETS', True):
+            try:
+                from overlay.basket_guard import is_basket_position
+                if is_basket_position(pos):
+                    continue
+            except Exception:
+                pass
+        if getattr(pos, 'current_price_stale', False):
+            continue
+        if pos.entry_price < min_entry:
+            continue
+        if pos.current_price < min_bid:
+            continue
+        mtc = pos.minutes_to_close
+        if mtc is not None and mtc < min_mtc:
+            continue
+        if pos.roi_pct > trigger_roi:
+            continue
+        # Sweep out at the best immediately-available liquidity (live bid).
+        pm._close_position(pos, pos.current_price, 'liquidity_sweep')
+        triggered.append(pos)
+        log.info(f"LIQUIDITY SWEEP: {pos.city} {pos.bucket_label[:28]} "
+                 f"ROI={pos.roi_pct:.0f}% <= {trigger_roi:.0f}% — cut fast @ "
+                 f"${pos.current_price:.4f} (thesis broken; only ~4% recover here)")
+    if triggered:
+        pm._save_state()
+        pm._assert_ledger()
     return triggered
 
 

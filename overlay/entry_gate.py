@@ -27,7 +27,8 @@ SETTING_DEFAULTS = {
     "ENTRY_BAND_GATE_ENABLED": True,
     "LATE_OBS_NO_MIN_ENTRY": 0.50,   # skip late_observed_no below this price
     "LATE_OBS_NO_MAX_ENTRY": 0.97,   # skip the near-1.0 no-edge tail
-    "LATE_OBS_YES_MAX_ENTRY": 0.15,  # skip late_observed_yes above this price
+    "LATE_OBS_YES_MIN_ENTRY": 0.20,  # skip late_observed_yes below this price (cheap-longshot junk band)
+    "LATE_OBS_YES_MAX_ENTRY": 0.50,  # skip late_observed_yes above this price (pays too much for the win)
 }
 
 
@@ -66,9 +67,12 @@ def entry_allowed(strategy, entry_price):
             return False, f"late_observed_no @ {p:.2f} > {hi:.2f} (no-edge tail)"
         return True, "ok"
     if tag == "late_observed_yes":
-        hi = _f("LATE_OBS_YES_MAX_ENTRY", 0.15)
+        lo = _f("LATE_OBS_YES_MIN_ENTRY", 0.20)
+        hi = _f("LATE_OBS_YES_MAX_ENTRY", 0.50)
+        if p < lo:
+            return False, f"late_observed_yes @ {p:.2f} < {lo:.2f} (cheap-longshot junk band)"
         if p > hi:
-            return False, f"late_observed_yes @ {p:.2f} > {hi:.2f} (lottery only pays cheap)"
+            return False, f"late_observed_yes @ {p:.2f} > {hi:.2f} (pays too much for the win)"
         return True, "ok"
     return True, "ok"
 
