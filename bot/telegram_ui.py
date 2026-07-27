@@ -1834,15 +1834,21 @@ class TelegramBot:
                 try:
                     st = self.ml.get_status()
                     active = st.get('enabled')
+                    # NOTE: precompute any value that contains a backslash escape
+                    # (\u2705 etc.) into a local. Python 3.11 forbids a backslash
+                    # inside an f-string {expression}; hoisting keeps it 3.11-safe.
+                    active_txt = ('\u2705 yes' if active
+                                  else '\u274C no \u2014 no API key, using LOCAL model')
+                    last_err = (st.get('last_error') or '\u2014')[:80]
                     self.send(
                         "\U0001F9E0 <b>ML Status</b>\n"
-                        f"Provider active: {'\u2705 yes' if active else '\u274C no \u2014 no API key, using LOCAL model'}\n"
+                        f"Provider active: {active_txt}\n"
                         f"Decision model: <code>{st.get('model')}</code>\n"
                         f"Analysis model: <code>{st.get('analysis_model')}</code>\n"
                         f"Local fallback: <code>{st.get('local_model')}</code>\n"
                         f"Calls: {st.get('calls')}  \u2022  tokens: {st.get('tokens_used')}\n"
                         f"API failures: {st.get('api_failures')}  \u2022  timeout: {st.get('timeout_s')}s\n"
-                        f"Last error: <code>{(st.get('last_error') or '\u2014')[:80]}</code>\n"
+                        f"Last error: <code>{last_err}</code>\n"
                         "Run <code>/mltest</code> for a live WORKS/NOT-WORKING check."
                     )
                 except Exception as e:
