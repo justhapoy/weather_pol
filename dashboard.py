@@ -172,10 +172,15 @@ class WeatherBot:
             sweep_exits = exit_policies.check_liquidity_sweep_exits(self.pm)
             thesis_exits = exit_policies.check_thesis_exits(self.pm)  # strict thesis-invalidation (very bad only)
             ml_review_exits = exit_policies.check_ml_reviews(self.pm)  # Req-31: ML early HOLD/SELL position review
+            # peak_cluster OUTER-leg take-profit (2026-07-27, OPT-IN default OFF):
+            # banks a profited shoulder leg while NEVER selling the peak leg, so
+            # the basket can still resolve to the full $1. No-op unless
+            # PEAK_CLUSTER_OUTER_TP_ENABLED is turned on.
+            cluster_tp_exits = exit_policies.check_peak_cluster_outer_tp(self.pm)
             # Flip/cap/sweep/thesis/ml-review closes pass their real reason into
             # _close_position; the PM _notify_close hook skips those reasons
             # (DASHBOARD_NOTIFIED_REASONS) so they are notified ONCE here.
-            for _p in (flip_exits or []) + (cap_exits or []) + (sweep_exits or []) + (thesis_exits or []) + (ml_review_exits or []):
+            for _p in (flip_exits or []) + (cap_exits or []) + (sweep_exits or []) + (thesis_exits or []) + (ml_review_exits or []) + (cluster_tp_exits or []):
                 try:
                     self.telegram.notify_close(_p)
                 except Exception as e:
@@ -534,7 +539,14 @@ class WeatherBot:
             log.debug(f"strategy_gate skipped: {_e}")
         try:
             from overlay import entry_gate as _eg
-            _ok, _why = _eg.entry_allowed(strategy, entry_price)
+            # Pass the model win-prob so the late_observed_yes edge gate and the
+            # global longshot floor can use forecast edge (fail-open if absent).
+            _mp = None
+            try:
+                _mp = float(our_prob)
+            except (TypeError, ValueError, NameError):
+                _mp = None
+            _ok, _why = _eg.entry_allowed(strategy, entry_price, model_prob=_mp)
             if not _ok:
                 self._funnel['band_gate'] += 1
                 log.info(f"   \u26d4 BAND {strategy}:{bucket_label[:18]} \u2014 {_why}")
@@ -1101,7 +1113,34 @@ class WeatherBot:
                 # liquidity-thin trim / portfolio guard / below-min checks can't
                 # pick the basket apart one leg at a time.
                 cl_legs = [lg for lg in sig.legs if lg.token_id]
+                # JUNK-LEG PRUNE (added 2026-07-27, peak_cluster ONLY): drop the
+                # dead ~1-3c dust legs that never win yet still pad basket cost
+                # (the audited -$12 drain). Keep the pricier legs (the ones the
+                # market actually rates near the peak). If pruning would fall
+                # below the min-leg floor, keep the top-priced legs so a valid
+                # ladder still stands. Fail-open: any error leaves legs as-is.
+                try:
+                    _leg_floor = float(getattr(Config, 'PEAK_CLUSTER_LEG_MIN_PRICE', 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    _leg_floor = 0.0
                 min_legs = int(getattr(Config, 'PEAK_CLUSTER_MIN_LEGS', 3))
+                if _leg_floor > 0 and cl_legs:
+                    _kept = [lg for lg in cl_legs if float(getattr(lg, 'price', 0.0)) >= _leg_floor]
+                    _dropped = len(cl_legs) - len(_kept)
+                    if _dropped > 0:
+                        if len(_kept) >= min_legs:
+                            log.info(f"   \U0001f9fa CLUSTER {city} — pruned {_dropped} junk leg(s) "
+                                     f"< ${_leg_floor:.2f} (kept {len(_kept)})")
+                            cl_legs = _kept
+                        else:
+                            # Pruning would break the ladder: keep the top-priced
+                            # legs up to the original count so the basket stands.
+                            log.info(f"   \U0001f9fa CLUSTER {city} — prune would drop below "
+                                     f"{min_legs} legs; keeping top-priced legs")
+                            cl_legs = sorted(
+                                cl_legs, key=lambda lg: float(getattr(lg, 'price', 0.0)),
+                                reverse=True,
+                            )[:max(min_legs, len(_kept))]
                 if len(cl_legs) < min_legs:
                     log.info(f"   🧺 CLUSTER {city} — only {len(cl_legs)} placeable legs "
                              f"(< {min_legs}) — skip (never a 1-leg cluster)")

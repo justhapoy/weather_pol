@@ -248,10 +248,18 @@ class Config:
     MAX_BUYS_PER_SCAN = int(os.getenv('MAX_BUYS_PER_SCAN', '6'))               # max NEW buys placed in one scan
 
     # PER-STRATEGY SIZE MULTIPLIER - lean toward what wins, away from what loses.
-    # peak_cluster is the only net-positive strategy in the logs -> boost it;
-    # late_observed_yes was 0% WR over 21 trades -> shrink it. 1.0 = neutral.
+    # UPDATED 2026-07-27 from the full 3-month trade audit (positions_mae_mfe):
+    #   late_observed_no = +$13.69 over 23 pos (65% WR) -> the ONLY real winner,
+    #     keep the 1.3 lean; peaker_cool basket also net-positive (untouched).
+    #   peak_cluster was actually -$12.08 (14% WR) NOT positive -> the old 1.25
+    #     "only net-positive" comment was STALE/WRONG; drop to 1.0 neutral so a
+    #     losing basket is no longer up-sized. The prune + outer-TP fixes below
+    #     do the real work on peak_cluster quality.
+    #   late_observed_yes = -$9.62 (0% WR) -> keep it small at 0.6 (the new
+    #     forecast-edge gate in overlay/entry_gate.py is what makes it "good").
+    # 1.0 = neutral. Env vars still override every value.
     STRATEGY_SIZE_MULT = {
-        'peak_cluster': float(os.getenv('SIZE_MULT_PEAK_CLUSTER', '1.25')),
+        'peak_cluster': float(os.getenv('SIZE_MULT_PEAK_CLUSTER', '1.0')),
         'late_observed_yes': float(os.getenv('SIZE_MULT_LATE_OBSERVED_YES', '0.6')),
         'late_observed_no': float(os.getenv('SIZE_MULT_LATE_OBSERVED_NO', '1.3')),
         'quick_flip': float(os.getenv('SIZE_MULT_QUICK_FLIP', '1.0')),
@@ -322,7 +330,14 @@ class Config:
     LATE_OBSERVED_MAX_LEGS = int(os.getenv('LATE_OBSERVED_MAX_LEGS', '4'))
     # --- Signal-strength -> absolute-USD allocation ladder (replaces flat %-Kelly) ---
     LATE_OBSERVED_SIZE_FLOOR_USD = float(os.getenv('LATE_OBSERVED_SIZE_FLOOR_USD', '3.0'))   # weakest valid signal (~$3-4)
-    LATE_OBSERVED_SIZE_MAX_USD = float(os.getenv('LATE_OBSERVED_SIZE_MAX_USD', '15.0'))      # strongest signal (HARD MAX $15)
+    LATE_OBSERVED_SIZE_MAX_USD = float(os.getenv('LATE_OBSERVED_SIZE_MAX_USD', '15.0'))      # strongest signal (fixed-$ HARD MAX)
+    # BALANCE-AWARE MAX (added 2026-07-27): late_observed_no is the only proven
+    # winner, so as the balance compounds we let its hard cap grow WITH the
+    # balance instead of being frozen at a flat $15. Effective max per late-
+    # observed leg = max(LATE_OBSERVED_SIZE_MAX_USD, LATE_OBSERVED_SIZE_MAX_PCT *
+    # balance). Set LATE_OBSERVED_SIZE_MAX_PCT = 0 to disable and keep the flat
+    # fixed cap only. 0.05 = up to 5% of balance for the strongest signal.
+    LATE_OBSERVED_SIZE_MAX_PCT = float(os.getenv('LATE_OBSERVED_SIZE_MAX_PCT', '0.05'))
     LATE_OBSERVED_EDGE_FULL = float(os.getenv('LATE_OBSERVED_EDGE_FULL', '0.25'))            # post-fee edge counted as max strength
     LATE_OBSERVED_W_EDGE = float(os.getenv('LATE_OBSERVED_W_EDGE', '0.6'))                   # weight of edge in the strength score
     LATE_OBSERVED_W_GRADE = float(os.getenv('LATE_OBSERVED_W_GRADE', '0.4'))                 # weight of grade in the strength score
@@ -475,6 +490,24 @@ class Config:
     PEAK_CLUSTER_CONTIGUOUS_ENABLED = os.getenv('PEAK_CLUSTER_CONTIGUOUS_ENABLED', '1') == '1'
     PEAK_CLUSTER_PROB_BASED_ENABLED = os.getenv('PEAK_CLUSTER_PROB_BASED_ENABLED', '1') == '1'
     PEAK_CLUSTER_PROB_MIN = float(os.getenv('PEAK_CLUSTER_PROB_MIN', '0.10'))
+    # --- peak_cluster QUALITY (added 2026-07-27) --------------------------------
+    # The 3-month audit shows peak_cluster at -$12.08 / 14% WR: it buys too many
+    # dead ~1-3c legs that never win but still cost money. Two fixes, both
+    # peak_cluster-ONLY (never touch the peaker cool/warm baskets):
+    #  (1) PRUNE junk legs: drop any leg priced below PEAK_CLUSTER_LEG_MIN_PRICE
+    #      from the basket before sizing (a 1-2c leg is lottery dust that just
+    #      pads basket cost). The basket must still keep >= PEAK_CLUSTER_MIN_LEGS
+    #      legs or it's skipped entirely.
+    PEAK_CLUSTER_LEG_MIN_PRICE = float(os.getenv('PEAK_CLUSTER_LEG_MIN_PRICE', '0.12'))
+    #  (2) OUTER-LEG partial take-profit (OPT-IN, default OFF): you can't ID the
+    #      single winning leg mid-flight, and selling the winner caps the $1
+    #      payout -- so this ONLY ever trims the *outer* (non-peak) legs of a
+    #      basket once they've run, banking some cost back while the core/peak
+    #      legs still hold to resolution for the full $1. Never sells the peak
+    #      bucket. See trading/exit_policies.check_peak_cluster_outer_tp().
+    PEAK_CLUSTER_OUTER_TP_ENABLED = os.getenv('PEAK_CLUSTER_OUTER_TP_ENABLED', '0') == '1'
+    PEAK_CLUSTER_OUTER_TP_ROI = float(os.getenv('PEAK_CLUSTER_OUTER_TP_ROI', '0.60'))   # trim an outer leg once its ROI >= this (0.60 = +60%)
+    PEAK_CLUSTER_OUTER_TP_FRACTION = float(os.getenv('PEAK_CLUSTER_OUTER_TP_FRACTION', '0.50'))  # sell this fraction of the outer leg
 
     # ===================================================================
     # SAFETY PEAK - DEAD (merged into PEAKER). Knobs kept so old envs don't break.
@@ -656,6 +689,16 @@ class Config:
     # stays snappy and the bot isn't waiting ~7s on every market.
     ML_MODEL = os.getenv('ML_MODEL', 'gpt-5.4-mini')
     ML_ANALYSIS_MODEL = os.getenv('ML_ANALYSIS_MODEL', 'gpt-5.5')
+    # PROVIDER PROFILE (2026-07-27): selects the wire-format used to talk to the
+    # endpoint at ML_API_URL. 'openai_compatible' works for OpenAI, Groq,
+    # Together, OpenRouter, Fireworks, vLLM, LM Studio, etc. Other presets:
+    # 'openai', 'anthropic', 'google_gemini', 'cohere', 'ollama'. Set it in the
+    # env or via Telegram /mlsetup. ML_LOCKED_PROFILE (set by /mlsetup) pins the
+    # choice and wins over ML_PROVIDER_PROFILE; /mlreset clears the lock. This is
+    # why the old default endpoint silently never fired: api.freemodel.dev is
+    # dead -- point ML_API_URL at a live provider and pick the matching profile.
+    ML_PROVIDER_PROFILE = os.getenv('ML_PROVIDER_PROFILE', 'openai_compatible')
+    ML_LOCKED_PROFILE = os.getenv('ML_LOCKED_PROFILE', '')
     # /mlanalysis on/off (the LLM narrative report). When OFF a local heuristic
     # report is used instead (no API call).
     ML_ANALYSIS_ENABLED = os.getenv('ML_ANALYSIS_ENABLED', '1') == '1'
