@@ -765,11 +765,16 @@ class TelegramBot:
             log.debug(f"Telegram sendDocument failed: {e}")
             return False
 
+    # 'pnl' is per-row realized PnL. IMPORTANT: REDEEM rows now carry pnl=0 (the
+    # win is booked once on its SETTLE row) so SUMMING the pnl column no longer
+    # double-counts wins. 'payout' (redeem cash-back) and 'settle_pnl' (the
+    # win's PnL, for reference on the redeem row) are shown as separate columns
+    # so the cash movement is still visible without polluting the pnl total.
     _CSV_COLUMNS = [
         'ts', 'action', 'city', 'bucket', 'market', 'strategy', 'signal',
         'entry_price', 'exit_price', 'shares', 'cost_usd', 'edge', 'grade',
-        'status', 'exit_reason', 'settle_source', 'pnl', 'roi_pct',
-        'minutes_to_close', 'balance_after',
+        'status', 'exit_reason', 'settle_source', 'pnl', 'payout', 'settle_pnl',
+        'roi_pct', 'minutes_to_close', 'balance_after', 'note',
     ]
 
     def _csv_path(self) -> str:
@@ -1131,8 +1136,30 @@ class TelegramBot:
         closed = (all_closed if strat == 'all'
                   else [p for p in all_closed
                         if (getattr(p, 'strategy', '') or '\u2014') == strat])
-        closed.sort(key=lambda p: getattr(p, 'exit_time', None) or p.entry_time,
-                    reverse=True)
+        # ORDER BY STRATEGY when unfiltered so closed positions are GROUPED by
+        # strategy (each strategy block contiguous, newest-first inside it).
+        # A single-strategy filter keeps a simple newest-first list.
+        def _when(p):
+            t = getattr(p, 'exit_time', None) or p.entry_time
+            try:
+                return t.timestamp()
+            except Exception:
+                return 0.0
+        if strat == 'all':
+            closed.sort(key=lambda p: ((getattr(p, 'strategy', '') or '\u2014'), -_when(p)))
+        else:
+            closed.sort(key=_when, reverse=True)
+        # Per-strategy subtotals over the WHOLE filtered set, so the by-strategy
+        # status line stays correct even when a group spans multiple pages.
+        strat_tot = {}
+        for _p in closed:
+            s = getattr(_p, 'strategy', '') or '\u2014'
+            w, l, r = strat_tot.get(s, (0, 0, 0.0))
+            oc = self.pm._closed_outcome(_p)
+            w += 1 if oc == 'win' else 0
+            l += 1 if oc == 'loss' else 0
+            r += (_p.pnl or 0.0)
+            strat_tot[s] = (w, l, r)
         total = len(closed)
         pages = max(1, (total + self._DONE_PAGE - 1) // self._DONE_PAGE)
         page = max(0, min(page, pages - 1))
@@ -1146,7 +1173,16 @@ class TelegramBot:
                 f"{wins}W/{losses}L | realized ${realized:+.2f}\n\n")
         if not chunk:
             text += "No closed positions in this view.\n"
+        cur_strat = None
         for p in chunk:
+            # Group header + spacing whenever the strategy changes (unfiltered).
+            if strat == 'all':
+                s = getattr(p, 'strategy', '') or '\u2014'
+                if s != cur_strat:
+                    cur_strat = s
+                    gw, gl, gr = strat_tot.get(s, (0, 0, 0.0))
+                    text += (f"\n\u2501\u2501 <b>{self._esc(self._short_strat(s))}</b> "
+                             f"\u00B7 {gw}W/{gl}L \u00B7 ${gr:+.2f} \u2501\u2501\n")
             val = p.pnl or 0.0
             pe = '\u2705' if val > 0 else ('\u274C' if val < 0 else '\u2796')
             bought = p.entry_time.strftime('%m-%d %H:%M') if p.entry_time else '?'
@@ -1791,6 +1827,104 @@ class TelegramBot:
             self.send_ai_summary()
         elif cmd in ('/mlanalysis', '/ml', '/mlreport'):
             self.send_ml_analysis()
+        elif cmd in ('/mlstatus', '/mlhealth', '/mlconfig'):
+            if not self.ml:
+                self.send("\U0001F9E0 <b>ML</b>: engine not attached \u2014 running rules/local model only.")
+            else:
+                try:
+                    st = self.ml.get_status()
+                    active = st.get('enabled')
+                    self.send(
+                        "\U0001F9E0 <b>ML Status</b>\n"
+                        f"Provider active: {'\u2705 yes' if active else '\u274C no \u2014 no API key, using LOCAL model'}\n"
+                        f"Decision model: <code>{st.get('model')}</code>\n"
+                        f"Analysis model: <code>{st.get('analysis_model')}</code>\n"
+                        f"Local fallback: <code>{st.get('local_model')}</code>\n"
+                        f"Calls: {st.get('calls')}  \u2022  tokens: {st.get('tokens_used')}\n"
+                        f"API failures: {st.get('api_failures')}  \u2022  timeout: {st.get('timeout_s')}s\n"
+                        f"Last error: <code>{(st.get('last_error') or '\u2014')[:80]}</code>\n"
+                        "Run <code>/mltest</code> for a live WORKS/NOT-WORKING check."
+                    )
+                except Exception as e:
+                    self.send(f"\u26A0\uFE0F ML status unavailable: {e}")
+        elif cmd in ('/mltest', '/mlping'):
+            if not self.ml:
+                self.send("\U0001F9E0 ML engine not attached; nothing to test. Set ML_API_KEY + ML_API_URL + ML_MODEL and restart.")
+            else:
+                self.send("\U0001F9E0 Testing ML provider\u2026 (one live call)")
+                try:
+                    r = self.ml.self_test()
+                    if r.get('ok'):
+                        self.send(
+                            "\u2705 <b>ML WORKS</b>\n"
+                            f"Model: <code>{r.get('model')}</code>\n"
+                            f"URL: <code>{r.get('url')}</code>\n"
+                            f"Latency: {r.get('latency_s')}s\n"
+                            f"Reply: <code>{(r.get('reply') or '')[:60]}</code>"
+                        )
+                    else:
+                        self.send(
+                            "\u274C <b>ML NOT WORKING</b> (bot keeps trading on rules/local)\n"
+                            f"Model: <code>{r.get('model')}</code>\n"
+                            f"URL: <code>{r.get('url')}</code>\n"
+                            f"Reason: <code>{(r.get('reason') or r.get('error') or 'unknown')[:120]}</code>"
+                        )
+                except Exception as e:
+                    self.send(f"\u26A0\uFE0F ML test error: {e}")
+        elif cmd in ('/mlsetup', '/mlprovider', '/mlprofile'):
+            # Pick the provider wire-format so the ML talks to whatever endpoint
+            # you point ML_API_URL at. Usage:
+            #   /mlsetup                -> list profiles + current selection
+            #   /mlsetup openai         -> select a profile (and LOCK it)
+            try:
+                from ml import provider_profiles as _pp
+            except Exception as e:
+                self.send(f"\u26A0\uFE0F profiles unavailable: {e}")
+                return
+            from bot import settings_store
+            if len(parts) >= 2:
+                sel = parts[1].strip().lower()
+                if sel not in _pp.PROFILES:
+                    names = ', '.join(_pp.PROFILES.keys())
+                    self.send(f"\u274C Unknown profile <code>{self._esc(sel)}</code>.\nPick one of: <code>{names}</code>")
+                    return
+                settings_store.set_value('ML_PROVIDER_PROFILE', sel)
+                settings_store.set_value('ML_LOCKED_PROFILE', sel)
+                prof = _pp.PROFILES[sel]
+                self.send(
+                    f"\u2705 <b>ML provider locked: {self._esc(prof.label)}</b>\n"
+                    f"Chat path: <code>{self._esc(prof.chat_path)}</code>\n"
+                    f"Auth: <code>{self._esc(prof.auth_header or ('?key=' if prof.key_in_query else '(none)'))}</code>\n"
+                    f"Now set <code>ML_API_URL</code> (base), <code>ML_API_KEY</code>, "
+                    f"<code>ML_MODEL</code> and restart, then run <code>/mltest</code>.\n"
+                    f"Undo with <code>/mlreset</code>."
+                )
+            else:
+                cur = (getattr(self.ml, 'profile', None).name if self.ml and getattr(self.ml, 'profile', None) else '\u2014')
+                lines = ["\U0001F9E0 <b>ML provider profiles</b>",
+                         f"Active: <code>{self._esc(cur)}</code>\n",
+                         "Choose the wire-format that matches your endpoint:"]
+                for name, prof in _pp.PROFILES.items():
+                    mark = '\u2022 ' if name == cur else '   '
+                    lines.append(f"{mark}<code>{name}</code> \u2014 {self._esc(prof.label)}")
+                lines.append("\nSelect + lock with <code>/mlsetup NAME</code> "
+                             "(e.g. <code>/mlsetup openai</code>). Then set "
+                             "<code>ML_API_URL</code>/<code>ML_API_KEY</code>/<code>ML_MODEL</code> and <code>/mltest</code>.")
+                self.send("\n".join(lines))
+        elif cmd == '/mlreset':
+            # Clear the locked profile + reset failure counters so the ML layer
+            # re-detects cleanly on next restart. Never touches trading.
+            from bot import settings_store
+            settings_store.set_value('ML_LOCKED_PROFILE', '')
+            if self.ml:
+                try:
+                    self.ml._api_failures = 0
+                    self.ml._last_error = ''
+                except Exception:
+                    pass
+            self.send("\u267B\uFE0F <b>ML lock cleared.</b> The provider profile will "
+                      "fall back to <code>ML_PROVIDER_PROFILE</code> (or auto-default) "
+                      "on next restart. Failure counters reset. Trading untouched.")
         elif cmd == '/redeem':
             if self.pm:
                 count = self.pm.redeem_all_winning()
@@ -1860,6 +1994,10 @@ class TelegramBot:
                 "/done — closed history + open positions (🟢/🔴)\n"
                 "/aisummary — recent runtime warnings/errors to share\n"
                 "/mlanalysis — ML report: how it's going, what's failing\n"
+                "/mlstatus — ML provider config + health (calls, failures, last error)\n"
+                "/mltest — live-ping the ML provider: shows WORKS / NOT WORKING\n"
+                "/mlsetup [name] — list ML providers / lock one (openai, anthropic, gemini, ...)\n"
+                "/mlreset — unlock the provider + clear ML failure counters\n"
                 "/redeem — redeem winning positions\n"
                 "/reserve [USD] — view/set untouchable cash reserve\n"
                 "/takeout [USD|withdraw] — set win-skim target / withdraw the pool\n"

@@ -1110,7 +1110,22 @@ class PositionManager:
             pos.pnl = payout - pos.cost_usd
             self.total_redeemed += payout
             log.info(f"💰 REDEEM: {pos.bucket_label} → +${payout:.2f}")
-            self._log_paper_trade('REDEEM', pos, extra={'payout': round(payout, 2)})
+            # DOUBLE-COUNT FIX (2026-07-27): the WIN's PnL was already booked on
+            # the SETTLE row (reason='won'). Redemption only moves the locked
+            # cost back into cash — it is NOT a second, separate gain. If the
+            # REDEEM row also carried pos.pnl, any tool that SUMS the pnl column
+            # of paper_trades would count every win twice (this is exactly the
+            # +$57 vs the true ~$9 that was reported). So log the REDEEM row with
+            # pnl/realized_pnl = 0 (payout is kept as an explicit extra field for
+            # reference). pos.pnl itself is left untouched so the conserved
+            # ledger (realized = sold+lost+redeemed) still balances.
+            self._log_paper_trade('REDEEM', pos, extra={
+                'payout': round(payout, 2),
+                'pnl': 0.0,
+                'realized_pnl': 0.0,
+                'settle_pnl': round(pos.pnl, 4),
+                'note': 'win already booked at SETTLE; redeem is cash-move only',
+            })
             self._save_state()
             self._assert_ledger()
             return True

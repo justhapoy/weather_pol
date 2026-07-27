@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 
 from config import Config
 from logger import log
+from ml.provider_profiles import get_profile, gemini_url
 
 
 class MLDecisionEngine:
@@ -54,11 +55,16 @@ class MLDecisionEngine:
         self.analysis_max_tokens = int(getattr(Config, 'ML_ANALYSIS_MAX_TOKENS', 1200))
         self.analysis_enabled = bool(getattr(Config, 'ML_ANALYSIS_ENABLED', True))
         self.enabled = bool(self.api_key)
+        # PROVIDER PROFILE (2026-07-27): a LOCKED profile (set via /mlsetup)
+        # wins over the configured one, which wins over the safe
+        # openai_compatible default. The profile owns the auth header + the
+        # request/response wire format, so the SAME engine can talk to OpenAI,
+        # any OpenAI-compatible gateway, Anthropic, Gemini, Cohere or Ollama.
+        locked = (getattr(Config, 'ML_LOCKED_PROFILE', '') or '').strip()
+        configured = (getattr(Config, 'ML_PROVIDER_PROFILE', '') or '').strip()
+        self.profile = get_profile(locked or configured or None)
         self._session = requests.Session()
-        self._session.headers.update({
-            'Authorization': f'Bearer {self.api_key}',
-            'Content-Type': 'application/json',
-        })
+        self._session.headers.update(self.profile.headers(self.api_key))
         self._cache: Dict[str, Tuple[float, Dict]] = {}
         self._cache_ttl = 120  # 2 minutes
         self._total_tokens_used = 0
@@ -347,35 +353,20 @@ class MLDecisionEngine:
             "failing, what you observe per strategy, and 3 concrete improvements.\n"
             + "\n".join(lines[:40])
         )
-        try:
-            self._total_calls += 1
-            resp = self._session.post(
-                f"{self.base_url}/chat/completions",
-                json={
-                    'model': self.analysis_model,
-                    'messages': [
-                        {'role': 'system', 'content': 'You are a concise quantitative trading analyst.'},
-                        {'role': 'user', 'content': prompt},
-                    ],
-                    'max_tokens': self.analysis_max_tokens, 'temperature': 0.3,
-                },
-                timeout=max(self.timeout, 30),
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                self._total_tokens_used += data.get('usage', {}).get('total_tokens', 0)
-                txt = (data.get('choices', [{}])[0].get('message', {})
-                       .get('content', '') or '').strip()
-                txt = self._strip_reasoning(txt).strip()
-                self._last_ok_ts = time.time()
-                if txt:
-                    return txt
-            else:
-                self._last_error = f"HTTP {resp.status_code}: {resp.text[:80]}"
-                log.warning(f"  ML report {self._last_error}")
-        except Exception as e:
-            self._last_error = str(e)[:80]
-            log.warning(f"  ML report error: {self._last_error}")
+        self._total_calls += 1
+        r = self._chat_call(self.analysis_model,
+                            'You are a concise quantitative trading analyst.',
+                            prompt, self.analysis_max_tokens, 0.3,
+                            timeout=max(self.timeout, 30))
+        if r['ok']:
+            self._total_tokens_used += r['tokens']
+            txt = self._strip_reasoning(r['content'] or '').strip()
+            self._last_ok_ts = time.time()
+            if txt:
+                return txt
+        else:
+            self._last_error = r['error']
+            log.warning(f"  ML report {self._last_error}")
         return heur
 
     def _report_heuristic(self, stats: Dict, by_strat: Dict,
@@ -407,43 +398,54 @@ class MLDecisionEngine:
     # ------------------------------------------------------------------ #
     # Core query + parsing
     # ------------------------------------------------------------------ #
+    def _chat_call(self, model, system, user, max_tokens, temperature,
+                   timeout=None) -> Dict:
+        """Provider-agnostic single chat round-trip. NEVER raises: always returns
+        {ok, status, content, tokens, error}. The engine treats content='' as
+        'no answer' and falls back to the local model, so a dead or misconfigured
+        provider can never crash or block the bot (fail-open, no collapse)."""
+        p = self.profile
+        try:
+            if p.name == 'google_gemini':
+                url = gemini_url(self.base_url, model, self.api_key)
+            else:
+                url = p.full_url(self.base_url, self.api_key)
+            body = p.body(model, system or '', user, int(max_tokens),
+                          float(temperature))
+            resp = self._session.post(url, json=body,
+                                      timeout=timeout or self.timeout)
+            if resp.status_code != 200:
+                return {'ok': False, 'status': resp.status_code, 'content': '',
+                        'tokens': 0,
+                        'error': f"HTTP {resp.status_code}: {resp.text[:80]}"}
+            data = resp.json()
+            return {'ok': True, 'status': 200, 'content': p.parse(data),
+                    'tokens': p.tokens(data), 'error': ''}
+        except requests.Timeout:
+            return {'ok': False, 'status': 0, 'content': '', 'tokens': 0,
+                    'error': 'timeout'}
+        except Exception as e:
+            return {'ok': False, 'status': 0, 'content': '', 'tokens': 0,
+                    'error': str(e)[:80]}
+
     def _query(self, prompt: str, max_tokens: Optional[int] = None) -> Dict:
         mt = int(max_tokens or self.decision_max_tokens)
-        try:
-            self._total_calls += 1
-            resp = self._session.post(
-                f"{self.base_url}/chat/completions",
-                json={
-                    'model': self.model,
-                    'messages': [
-                        {'role': 'system', 'content': 'You are a weather trading assistant. Think briefly if needed, then reply with the JSON answer only.'},
-                        {'role': 'user', 'content': prompt},
-                    ],
-                    'max_tokens': mt,
-                    'temperature': 0.1,
-                },
-                timeout=self.timeout,
-            )
-            if resp.status_code != 200:
-                self._api_failures += 1
-                self._last_error = f"HTTP {resp.status_code}: {resp.text[:80]}"
-                log.warning(f"  ML API FAIL [{self._api_failures}]: {self._last_error}")
-                return self._local_fallback('BUY', f'API HTTP {resp.status_code}')
-            data = resp.json()
-            content = data.get('choices', [{}])[0].get('message', {}).get('content', '{}')
-            self._total_tokens_used += data.get('usage', {}).get('total_tokens', 0)
-            self._last_ok_ts = time.time()
-            return self._parse_response(content)
-        except requests.Timeout:
+        self._total_calls += 1
+        r = self._chat_call(
+            self.model,
+            'You are a weather trading assistant. Think briefly if needed, then reply with the JSON answer only.',
+            prompt, mt, 0.1)
+        if not r['ok']:
             self._api_failures += 1
-            self._last_error = 'timeout'
-            log.warning(f"  ML API TIMEOUT [{self._api_failures}] - using local model")
-            return self._local_fallback('BUY', 'API timeout')
-        except Exception as e:
-            self._api_failures += 1
-            self._last_error = str(e)[:80]
-            log.warning(f"  ML API ERROR [{self._api_failures}]: {self._last_error}")
-            return self._local_fallback('BUY', f'API: {str(e)[:30]}')
+            self._last_error = r['error']
+            if r['error'] == 'timeout':
+                log.warning(f"  ML API TIMEOUT [{self._api_failures}] - using local model")
+                return self._local_fallback('BUY', 'API timeout')
+            log.warning(f"  ML API FAIL [{self._api_failures}]: {self._last_error}")
+            return self._local_fallback('BUY', f"API {str(r['error'])[:30]}")
+        self._total_tokens_used += r['tokens']
+        self._last_ok_ts = time.time()
+        return self._parse_response(r['content'] or '{}')
 
     def _local_fallback(self, default_action: str, reason: str) -> dict:
         if self.local_model is not None:
@@ -558,35 +560,23 @@ class MLDecisionEngine:
             'timeout_s': self.timeout,
             'last_error': self._last_error,
             'cache_size': len(self._cache),
+            'profile': self.profile.name,
         }
 
     def self_test(self) -> Dict:
         """Live round-trip test of the API key/URL/model. Returns a dict with ok/latency/reply."""
         if not self.enabled:
             return {'ok': False, 'reason': 'ML_API_KEY not set', 'url': self.base_url,
-                    'model': self.model}
+                    'model': self.model, 'profile': self.profile.name}
         t0 = time.time()
-        try:
-            resp = self._session.post(
-                f"{self.base_url}/chat/completions",
-                json={'model': self.model,
-                      'messages': [{'role': 'user', 'content': 'Reply with the single word OK.'}],
-                      'max_tokens': self.decision_max_tokens, 'temperature': 0.0},
-                timeout=max(self.timeout, 15),
-            )
-            dt = time.time() - t0
-            ok = resp.status_code == 200
-            body = ''
-            if ok:
-                body = (resp.json().get('choices', [{}])[0].get('message', {})
-                        .get('content', '') or '').strip()
-                body = self._strip_reasoning(body)
-            return {'ok': ok, 'status': resp.status_code, 'latency_s': round(dt, 2),
-                    'reply': body[:60], 'url': self.base_url, 'model': self.model,
-                    'error': '' if ok else resp.text[:120]}
-        except Exception as e:
-            return {'ok': False, 'latency_s': round(time.time() - t0, 2),
-                    'url': self.base_url, 'model': self.model, 'error': str(e)[:120]}
+        r = self._chat_call(self.model, '', 'Reply with the single word OK.',
+                            self.decision_max_tokens, 0.0,
+                            timeout=max(self.timeout, 15))
+        dt = time.time() - t0
+        body = self._strip_reasoning(r['content'] or '')
+        return {'ok': r['ok'], 'status': r['status'], 'latency_s': round(dt, 2),
+                'reply': body[:60], 'url': self.base_url, 'model': self.model,
+                'profile': self.profile.name, 'error': r['error']}
 
 
 if __name__ == '__main__':

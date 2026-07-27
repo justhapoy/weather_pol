@@ -311,6 +311,91 @@ def check_profit_caps(pm):
     return triggered
 
 
+def check_peak_cluster_outer_tp(pm):
+    """peak_cluster OUTER-LEG take-profit (OPT-IN, default OFF).
+
+    You cannot know mid-flight which single basket leg will win, and selling the
+    eventual winner caps the $1.00 payout the basket needs. So this NEVER sells
+    the peak/core leg -- it only banks a run-up OUTER (shoulder) leg once it has
+    profited, freeing some cost back while the peak + remaining legs ride to
+    resolution for the full $1.
+
+    Rules (peak_cluster-only; the peaker cool/warm baskets are NOT touched):
+      * group open peak_cluster legs by cluster_box;
+      * the PEAK leg of a box = the highest-priced leg (the market's most-likely
+        winner) -- it is NEVER trimmed;
+      * an OUTER leg is eligible when its ROI >= PEAK_CLUSTER_OUTER_TP_ROI
+        (a fraction, 0.60 = +60%), it has a live bid, and it isn't stale;
+      * at most floor(#outer * PEAK_CLUSTER_OUTER_TP_FRACTION) legs (>=1 when any
+        are eligible) are trimmed per box, taking the highest-ROI ones first.
+
+    Full closes only (there is no partial-sell primitive; the conserved ledger
+    in _close_position stays the single source of truth). Fail-open everywhere.
+    """
+    if not _cfg('PEAK_CLUSTER_OUTER_TP_ENABLED', False):
+        return []
+    try:
+        roi_frac = float(_cfg('PEAK_CLUSTER_OUTER_TP_ROI', 0.60))
+        trim_frac = float(_cfg('PEAK_CLUSTER_OUTER_TP_FRACTION', 0.50))
+    except (TypeError, ValueError):
+        return []
+    if trim_frac <= 0:
+        return []
+    roi_thresh_pct = roi_frac * 100.0
+    # Bucket open peak_cluster legs by their box label.
+    boxes = {}
+    try:
+        for pos in pm.get_open_positions():
+            strat = (getattr(pos, 'strategy', '') or '').strip().lower()
+            if strat != 'peak_cluster':
+                continue
+            box = (getattr(pos, 'cluster_box', '') or '').strip()
+            if not box:
+                continue
+            boxes.setdefault(box, []).append(pos)
+    except Exception as e:  # pragma: no cover
+        log.debug(f"outer-tp scan failed: {e}")
+        return []
+    triggered = []
+    for box, legs in boxes.items():
+        if len(legs) < 2:
+            continue  # a 1-leg remnant has no "outer" leg to trim
+        # Peak = highest-priced leg (never trim). entry_price gives a stable
+        # ranking; on ties the first wins.
+        try:
+            peak_leg = max(legs, key=lambda p: float(getattr(p, 'entry_price', 0.0) or 0.0))
+        except Exception:
+            continue
+        outer = [p for p in legs if p is not peak_leg]
+        eligible = []
+        for p in outer:
+            if getattr(p, 'current_price_stale', False):
+                continue
+            if float(getattr(p, 'current_price', 0.0) or 0.0) <= 0:
+                continue
+            if float(getattr(p, 'roi_pct', 0.0) or 0.0) >= roi_thresh_pct:
+                eligible.append(p)
+        if not eligible:
+            continue
+        eligible.sort(key=lambda p: float(getattr(p, 'roi_pct', 0.0) or 0.0), reverse=True)
+        max_trim = int(len(outer) * trim_frac)
+        if max_trim < 1:
+            max_trim = 1  # trim at least one when the fraction rounds to zero
+        for p in eligible[:max_trim]:
+            try:
+                pm._close_position(p, p.current_price, 'peak_cluster_outer_tp')
+                triggered.append(p)
+                log.info(f"CLUSTER OUTER-TP: {p.city} {p.bucket_label[:28]} [{box}] "
+                         f"ROI={p.roi_pct:+.0f}% @ ${p.current_price:.4f} "
+                         f"PnL=${p.pnl:+.2f} (peak leg holds)")
+            except Exception as e:  # pragma: no cover
+                log.debug(f"outer-tp close failed: {e}")
+    if triggered:
+        pm._save_state()
+        pm._assert_ledger()
+    return triggered
+
+
 def check_liquidity_sweep_exits(pm):
     """LIQUIDITY SWEEP: when a NON-basket thesis breaks and ROI collapses to
     <= LIQ_SWEEP_TRIGGER_ROI_PCT (default -50%), cut it FAST at the best

@@ -276,7 +276,24 @@ class LateObservedTempStrategy:
         # on weakly-locked days). The NO side keeps the looser self.min_lock_conf
         # above; here we only decide whether YES legs are eligible this scan.
         allow_yes = lock >= self.yes_min_lock
-        params = replace(self.params, allow_yes=allow_yes)
+        # BALANCE-AWARE MAX CAP (added 2026-07-27): late_observed_no is the only
+        # proven winner, so let its hard $ cap grow WITH the balance as it
+        # compounds. Effective cap = max(fixed LATE_OBSERVED_SIZE_MAX_USD,
+        # LATE_OBSERVED_SIZE_MAX_PCT * balance). pct = 0 keeps the flat cap.
+        # This only lifts the CEILING; the sizing math itself is unchanged.
+        eff_size_max = self.params.size_max_usd
+        try:
+            _c = self.config if hasattr(self, "config") else None
+        except Exception:
+            _c = None
+        try:
+            from config import Config as _Cfg
+            _pct = float(getattr(_Cfg, "LATE_OBSERVED_SIZE_MAX_PCT", 0.0) or 0.0)
+            if _pct > 0 and balance and balance > 0:
+                eff_size_max = max(eff_size_max, _pct * float(balance))
+        except Exception:
+            eff_size_max = self.params.size_max_usd
+        params = replace(self.params, allow_yes=allow_yes, size_max_usd=eff_size_max)
         if not self.no_side_enabled:
             no_prices = None
             no_token_ids = None

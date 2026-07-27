@@ -51,11 +51,14 @@ BOOL_KEYS = [
     # peaker / cluster behaviour
     'PEAKER_PREFER_COOL', 'PEAKER_TRADE_DECIDED', 'PEAK_CLUSTER_TRADE_DECIDED',
     'PEAK_CLUSTER_CONTIGUOUS_ENABLED', 'PEAK_CLUSTER_PROB_BASED_ENABLED',
+    'PEAK_CLUSTER_OUTER_TP_ENABLED',
     # exits / liquidity / gating
     'THESIS_EXIT_ENABLED', 'LIQUIDITY_GUARD_ENABLED', 'LIQUIDITY_STRICT_BLOCK',
     'GRADE_SIZING_ENABLED', 'SKIP_DECIDED_MARKETS',
     # entry-band gate + research data capture (overlays)
     'ENTRY_BAND_GATE_ENABLED', 'MAE_MFE_LOGGING_ENABLED',
+    # global longshot floor (overlay/entry_gate)
+    'GLOBAL_MIN_ENTRY_GATE_ENABLED',
     # weather overlays: last-good observed cache + health watcher
     'OBSERVED_CACHE_ENABLED', 'WEATHER_TRACE_ENABLED',
     # liquidity-sweep exit (fast cut at -50% into available liquidity)
@@ -78,6 +81,7 @@ NUM_KEYS: Dict[str, tuple] = {
     'KELLY_TIER_VGOOD_USD':        (2, 50, 1, False),
     'KELLY_TIER_PERFECT_USD':      (3, 100, 1, False),
     'PORTFOLIO_RESERVE_PCT':       (0.00, 0.50, 0.05, False),
+    'PORTFOLIO_MAX_DEPLOY_PCT':    (0.10, 1.00, 0.05, False),
     'MAX_DEPLOY_PER_SCAN_PCT':     (0.05, 1.00, 0.05, False),
     'MAX_BUYS_PER_SCAN':           (1, 20, 1, True),
     'MAX_DAILY_DRAWDOWN_PCT':      (5, 90, 5, False),
@@ -93,6 +97,7 @@ NUM_KEYS: Dict[str, tuple] = {
     'LATE_OBSERVED_MAX_LEGS':      (1, 8, 1, True),
     'LATE_OBSERVED_SIZE_FLOOR_USD': (1, 20, 1, False),
     'LATE_OBSERVED_SIZE_MAX_USD':  (3, 50, 1, False),
+    'LATE_OBSERVED_SIZE_MAX_PCT':  (0.00, 0.25, 0.01, False),
     'LATE_OBSERVED_EDGE_FULL':     (0.05, 0.50, 0.05, False),
     'LATE_OBSERVED_NO_MIN_PRICE':  (0.01, 0.20, 0.01, False),
     'LATE_OBSERVED_NO_MAX_PRICE':  (0.80, 0.99, 0.01, False),
@@ -101,6 +106,11 @@ NUM_KEYS: Dict[str, tuple] = {
     'LATE_OBS_YES_MAX_ENTRY':      (0.05, 0.95, 0.05, False),
     'LATE_OBS_NO_MIN_ENTRY':       (0.01, 0.95, 0.01, False),
     'LATE_OBS_NO_MAX_ENTRY':       (0.50, 0.99, 0.01, False),
+    'LATE_OBS_YES_MIN_EDGE':       (0.00, 0.40, 0.01, False),
+    # global longshot floor (overlay/entry_gate) -- applies to all directional
+    # strategies except the multi-leg basket strategies
+    'GLOBAL_MIN_ENTRY_PRICE':      (0.00, 0.60, 0.01, False),
+    'GLOBAL_MIN_ENTRY_EDGE':       (0.00, 0.40, 0.01, False),
     # quick-flip
     'QUICK_FLIP_MIN_EDGE':         (0.00, 0.40, 0.02, False),
     'QUICK_FLIP_MAX_PER_MARKET':   (1, 5, 1, True),
@@ -140,6 +150,9 @@ NUM_KEYS: Dict[str, tuple] = {
     'PEAK_CLUSTER_MIN_CONF':       (0.00, 1.00, 0.05, False),
     'PEAK_CLUSTER_MAX_CENTER_PRICE': (0.50, 0.99, 0.05, False),
     'PEAK_CLUSTER_MAX_USD':        (3, 50, 1, False),
+    'PEAK_CLUSTER_LEG_MIN_PRICE':  (0.00, 0.40, 0.01, False),
+    'PEAK_CLUSTER_OUTER_TP_ROI':   (0.10, 3.00, 0.10, False),
+    'PEAK_CLUSTER_OUTER_TP_FRACTION': (0.10, 1.00, 0.10, False),
     # weather overlays
     'OBSERVED_CACHE_TTL_SECONDS':  (900, 43200, 900, True),
     # liquidity-sweep exit
@@ -174,13 +187,22 @@ NUM_KEYS: Dict[str, tuple] = {
 STR_KEYS: Dict[str, List[str]] = {
     'ML_MODEL':          ['gpt-5.4-mini', 'gpt-5.4', 'gpt-5.5', 'gpt-5.3-codex'],
     'ML_ANALYSIS_MODEL': ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex'],
+    # Provider wire-format (2026-07-27). First value = safe default. Also
+    # settable/lockable via /mlsetup. ML_LOCKED_PROFILE is FREE_TEXT (below) so
+    # it can hold '' (unlocked) as well as any profile name.
+    'ML_PROVIDER_PROFILE': ['openai_compatible', 'openai', 'anthropic',
+                            'google_gemini', 'cohere', 'ollama'],
+    # Locked profile: free text ('' = unlocked). Needs a STR_KEYS entry so
+    # set_value accepts it; FREE_TEXT_STR_KEYS below makes _coerce store the
+    # raw string (including '') rather than snapping to a choice.
+    'ML_LOCKED_PROFILE': [''],
 }
 
 # STR keys that accept FREE TEXT (not a fixed choice list) — e.g. the overlay
 # city lists. For these, /set stores the raw string. The advanced-settings
 # overlay registers such keys here and gives them a 1-item choices list so the
 # v[0] default fallback in str_snapshot()/_persist() stays safe.
-FREE_TEXT_STR_KEYS = set()
+FREE_TEXT_STR_KEYS = {'ML_LOCKED_PROFILE'}
 
 # -- Tabs for the Telegram /settings panel. Each group lists the keys (toggles
 # and/or gates) shown when that tab is active, in display order. ------------
@@ -196,14 +218,15 @@ GROUPS: List[dict] = [
     {'id': 'ml', 'tab': 'ML', 'title': 'ML / AI Engine', 'keys': [
         'ML_ENABLED', 'ML_DECISION_ENABLED', 'ML_ANALYSIS_ENABLED',
         'ML_REVIEW_POSITIONS', 'ML_SELECT_MARKETS',
-        'ML_MODEL', 'ML_ANALYSIS_MODEL',
+        'ML_MODEL', 'ML_ANALYSIS_MODEL', 'ML_PROVIDER_PROFILE',
     ]},
     {'id': 'risk', 'tab': 'Risk', 'title': 'Risk, Drawdown & Sizing', 'keys': [
         'PORTFOLIO_GUARD_ENABLED', 'DRAWDOWN_GATE_ENABLED', 'QUICK_FLIP_BOOK_OR_CUT',
         'MAX_BET_PCT', 'MAX_POSITIONS', 'MAX_SINGLE_MARKET_PCT',
         'KELLY_MAX_FRACTION', 'KELLY_TIER_BASE_USD', 'KELLY_TIER_GOOD_USD',
         'KELLY_TIER_VGOOD_USD', 'KELLY_TIER_PERFECT_USD',
-        'PORTFOLIO_RESERVE_PCT', 'MAX_DEPLOY_PER_SCAN_PCT', 'MAX_BUYS_PER_SCAN',
+        'PORTFOLIO_RESERVE_PCT', 'PORTFOLIO_MAX_DEPLOY_PCT',
+        'MAX_DEPLOY_PER_SCAN_PCT', 'MAX_BUYS_PER_SCAN',
         'MAX_DAILY_DRAWDOWN_PCT', 'MAX_WEEKLY_DRAWDOWN_PCT', 'DRAWDOWN_COOLDOWN_MINUTES',
         'MIN_EDGE_TO_ENTER', 'GRADE_MIN_TO_TRADE', 'BALANCE_RESERVE_USD',
     ]},
@@ -212,13 +235,14 @@ GROUPS: List[dict] = [
         'LATE_OBSERVED_MIN_LOCK', 'LATE_OBSERVED_MIN_EDGE',
         'LATE_OBSERVED_YES_MIN_LOCK', 'LATE_OBSERVED_YES_MIN_EDGE',
         'LATE_OBSERVED_MAX_LEGS', 'LATE_OBSERVED_SIZE_FLOOR_USD',
-        'LATE_OBSERVED_SIZE_MAX_USD', 'LATE_OBSERVED_EDGE_FULL',
+        'LATE_OBSERVED_SIZE_MAX_USD', 'LATE_OBSERVED_SIZE_MAX_PCT', 'LATE_OBSERVED_EDGE_FULL',
         'LATE_OBSERVED_NO_MIN_PRICE', 'LATE_OBSERVED_NO_MAX_PRICE',
     ]},
     {'id': 'entry', 'tab': 'Entry', 'title': 'Entry Bands (price gates)', 'keys': [
         'ENTRY_BAND_GATE_ENABLED',
-        'LATE_OBS_YES_MIN_ENTRY', 'LATE_OBS_YES_MAX_ENTRY',
+        'LATE_OBS_YES_MIN_ENTRY', 'LATE_OBS_YES_MAX_ENTRY', 'LATE_OBS_YES_MIN_EDGE',
         'LATE_OBS_NO_MIN_ENTRY', 'LATE_OBS_NO_MAX_ENTRY',
+        'GLOBAL_MIN_ENTRY_GATE_ENABLED', 'GLOBAL_MIN_ENTRY_PRICE', 'GLOBAL_MIN_ENTRY_EDGE',
     ]},
     {'id': 'weather', 'tab': 'Weather', 'title': 'Weather Data & Health', 'keys': [
         'OBSERVED_CACHE_ENABLED', 'OBSERVED_CACHE_TTL_SECONDS',
@@ -249,7 +273,9 @@ GROUPS: List[dict] = [
         'PEAK_CLUSTER_MAX_COST', 'PEAK_CLUSTER_MIN_EDGE', 'PEAK_CLUSTER_MIN_CONF',
         'PEAK_CLUSTER_MAX_CENTER_PRICE', 'PEAK_CLUSTER_MAX_USD',
         'PEAK_CLUSTER_CONTIGUOUS_ENABLED', 'PEAK_CLUSTER_PROB_BASED_ENABLED',
-        'PEAK_CLUSTER_PROB_MIN',
+        'PEAK_CLUSTER_PROB_MIN', 'PEAK_CLUSTER_LEG_MIN_PRICE',
+        'PEAK_CLUSTER_OUTER_TP_ENABLED', 'PEAK_CLUSTER_OUTER_TP_ROI',
+        'PEAK_CLUSTER_OUTER_TP_FRACTION',
     ]},
     {'id': 'exits', 'tab': 'Exits', 'title': 'Exits & Liquidity', 'keys': [
         'THESIS_EXIT_ENABLED', 'LIQUIDITY_GUARD_ENABLED', 'LIQUIDITY_STRICT_BLOCK',
