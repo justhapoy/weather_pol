@@ -63,6 +63,11 @@ BOOL_KEYS = [
     'OBSERVED_CACHE_ENABLED', 'WEATHER_TRACE_ENABLED',
     # liquidity-sweep exit (fast cut at -50% into available liquidity)
     'LIQ_SWEEP_EXIT_ENABLED', 'LIQ_SWEEP_EXEMPT_BASKETS',
+    # golden_no fusion strategy + late-observed timing (overlay/golden_gate.py)
+    'GOLDEN_NO_ENABLED', 'GOLDEN_NO_SIDE_ONLY',
+    'LATE_OBS_TIMING_SAMEDAY_ENABLED', 'LATE_OBS_TIMING_1D_ENABLED',
+    'LATE_OBS_TIMING_2D_ENABLED', 'LATE_OBS_TIMING_3D_ENABLED',
+    'LATE_OBS_FETCH_AFTER_NEXT_DAY',
 ]
 
 # -- Numeric gates: key -> (min, max, step, is_int) ---------------------
@@ -181,6 +186,13 @@ NUM_KEYS: Dict[str, tuple] = {
     'SPREAD_MAX_COST':             (0.50, 2.00, 0.10, False),
     'STABILITY_MIN_SCORE':         (0.00, 1.00, 0.02, False),
     'STABILITY_EARLY_EXIT_PRICE':  (0.50, 0.99, 0.05, False),
+    # golden_no fusion strategy gates (overlay/golden_gate.py)
+    'GOLDEN_MIN_DAYS_TO_RES':       (0.0, 7.0, 0.5, False),
+    'GOLDEN_ENTRY_MIN':             (0.05, 0.95, 0.05, False),
+    'GOLDEN_ENTRY_MAX':             (0.05, 0.99, 0.05, False),
+    'GOLDEN_EDGE_MIN':              (0.0, 1.0, 0.05, False),
+    'GOLDEN_EDGE_MAX':              (0.0, 1.0, 0.05, False),
+    'GOLDEN_GRADE_MAX':             (0.0, 1.0, 0.05, False),
 }
 
 # -- String/choice settings: key -> list of allowed values (first = default) --
@@ -292,6 +304,14 @@ GROUPS: List[dict] = [
         'SNIPER_MAX_ENTRY_PRICE', 'BASKET_MAX_COST', 'BASKET_TIGHT_GRADE',
         'BASKET_TIGHT_CONFIDENCE', 'SPREAD_MAX_COST', 'STABILITY_MIN_SCORE',
         'STABILITY_EARLY_EXIT_PRICE',
+    ]},
+    {'id': 'golden', 'tab': 'Golden', 'title': 'Golden Filter + Late-Obs Timing', 'keys': [
+        'GOLDEN_NO_ENABLED', 'GOLDEN_NO_SIDE_ONLY',
+        'GOLDEN_MIN_DAYS_TO_RES', 'GOLDEN_ENTRY_MIN', 'GOLDEN_ENTRY_MAX',
+        'GOLDEN_EDGE_MIN', 'GOLDEN_EDGE_MAX', 'GOLDEN_GRADE_MAX',
+        'LATE_OBS_TIMING_SAMEDAY_ENABLED', 'LATE_OBS_TIMING_1D_ENABLED',
+        'LATE_OBS_TIMING_2D_ENABLED', 'LATE_OBS_TIMING_3D_ENABLED',
+        'LATE_OBS_FETCH_AFTER_NEXT_DAY',
     ]},
 ]
 

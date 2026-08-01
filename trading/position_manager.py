@@ -1559,6 +1559,100 @@ class PositionManager:
     # PERSISTENCE
     # ============================
 
+    def _dict_to_pos(self, pd):
+        """Rebuild a TrackedPosition from a _pos_to_dict() record (used by the
+        /update + /recover real-recovery path). Mirrors _load_state()."""
+        return TrackedPosition(
+            id=pd['id'],
+            market_title=pd.get('mt', pd.get('market_title', '')),
+            bucket_label=pd.get('bl', pd.get('bucket_label', '')),
+            token_id=pd.get('tid', pd.get('token_id', '')),
+            condition_id=pd.get('cid', pd.get('condition_id', '')),
+            entry_price=pd.get('ep', pd.get('entry_price', 0)),
+            shares=pd.get('sh', pd.get('shares', 0)),
+            cost_usd=pd.get('cu', pd.get('cost_usd', 0)),
+            current_price=pd.get('cp', pd.get('current_price', 0)),
+            current_value=pd.get('cv', pd.get('current_value', 0)),
+            entry_time=datetime.fromisoformat(pd.get('et', pd.get('entry_time', '2026-01-01T00:00:00+00:00'))),
+            resolution_time=datetime.fromisoformat(pd['rt']) if pd.get('rt') else None,
+            strategy=pd.get('st', pd.get('strategy', '')),
+            status=pd.get('status', 'open'),
+            pnl=pd.get('pnl', 0),
+            realized_pnl=pd.get('rpnl', 0),
+            redeemable=pd.get('rdm', pd.get('redeemable', False)),
+            city=pd.get('city', ''),
+            slug=pd.get('slug', ''),
+            peak_price=pd.get('pp', pd.get('peak_price', 0)),
+            stop_loss_pct=pd.get('sl', -80),
+            take_profit_price=pd.get('tp', 0.50),
+            exit_price=pd.get('xp'),
+            exit_reason=pd.get('xr', ''),
+            exit_time=datetime.fromisoformat(pd['xt']) if pd.get('xt') else None,
+            edge_at_entry=pd.get('edge', 0.0),
+            grade=pd.get('grade', 0.0),
+            lock_confidence=pd.get('lc', 0.0),
+            signal=pd.get('sig', ''),
+            reason=pd.get('why', ''),
+            last_good_price=pd.get('lgp', 0.0),
+            current_price_stale=pd.get('stale', False),
+            preclose_locked=pd.get('plk', False),
+            settle_source=pd.get('ss', ''),
+            hold_to_resolution=pd.get('h2r', False),
+            cluster_box=pd.get('cbox', ''),
+            flip_max_hold_minutes=pd.get('fmh', 0.0),
+        )
+
+    def export_open_snapshot(self):
+        """/update -- capture a RECOVERY snapshot of the CURRENT open book keyed
+        by condition_id/token_id, so a later /recover rebuilds the REAL
+        positions (not a trusted count) by matching market/condition id."""
+        opens = [self._pos_to_dict(p) for p in self.positions
+                 if getattr(p, 'status', '') in ('open', 'pending')]
+        return {
+            'ts': datetime.now(timezone.utc).isoformat(),
+            'paper_balance': self.paper_balance,
+            'open_count': len(opens),
+            'open_positions': opens,
+        }
+
+    def recover_open_snapshot(self, snap, restore_balance=True):
+        """/recover -- re-add open positions from a snapshot, matching by
+        (token/condition id, strategy) so duplicates are never created. REAL
+        recovery: positions are reconstructed from their market ids, not from a
+        stored win/loss count. Returns {'added','skipped'}."""
+        added = 0
+        skipped = 0
+        existing = {(getattr(p, 'token_id', ''), getattr(p, 'strategy', ''))
+                    for p in self.positions}
+        existing_cid = {(getattr(p, 'condition_id', ''), getattr(p, 'strategy', ''))
+                        for p in self.positions}
+        for pd in (snap.get('open_positions', []) or []):
+            key = (pd.get('tid', ''), pd.get('st', ''))
+            ckey = (pd.get('cid', ''), pd.get('st', ''))
+            if key in existing or (ckey[0] and ckey in existing_cid):
+                skipped += 1
+                continue
+            try:
+                pos = self._dict_to_pos(pd)
+                self.positions.append(pos)
+                existing.add(key)
+                if ckey[0]:
+                    existing_cid.add(ckey)
+                added += 1
+            except Exception as e:
+                log.debug(f"recover skip one: {e}")
+                skipped += 1
+        if restore_balance and 'paper_balance' in snap:
+            try:
+                self.paper_balance = float(snap['paper_balance'])
+            except Exception:
+                pass
+        try:
+            self._save_state()
+        except Exception:
+            pass
+        return {'added': added, 'skipped': skipped}
+
     def _save_state(self):
         """Save positions to disk."""
         try:

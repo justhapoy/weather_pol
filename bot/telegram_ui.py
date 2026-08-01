@@ -812,6 +812,71 @@ class TelegramBot:
         Read-only and fully defensive."""
         if not self.enabled:
             return
+        # ============================================================
+        # PRIMARY: weather_trace -- the REAL per-decision weather data
+        # (locks, model spread, provider agreement, starvation). Shipped
+        # FIRST + as flattened CSVs so it is the USEFUL export, not an
+        # afterthought behind the MAE dump. Fully defensive / read-only.
+        # ============================================================
+        import csv as _csv
+        _wt_sent = False
+        try:
+            from overlay import weather_trace as _wt
+            _wrecs = _wt.read_all()
+            _obs = [r for r in _wrecs if r.get('kind') == 'observed']
+            _fet = [r for r in _wrecs if r.get('kind') == 'fetch']
+            if _wrecs:
+                _locked = sum(1 for r in _obs if r.get('is_locked'))
+                _starved = sum(1 for r in _obs if r.get('starved'))
+                self.send(
+                    f"\U0001F321\uFE0F <b>Weather research dataset</b> \u2014 "
+                    f"{len(_obs)} observed-lock decisions + {len(_fet)} provider "
+                    f"fetches (locked {_locked}, starved {_starved}).\n"
+                    f"Flattened CSVs below: observed extreme, remaining model "
+                    f"spread, models-with-data vs total, provider peak agreement, "
+                    f"cache/starvation \u2014 join to outcomes for real what-if work."
+                )
+                if _obs:
+                    _ocols = ['ts', 'city', 'market', 'strategy', 'day', 'mode',
+                              'observed_extreme_c', 'current_temp_c',
+                              'remaining_spread_c', 'hours_remaining',
+                              'models_with_data', 'models_total', 'models_null',
+                              'is_locked', 'used_cache', 'starved', 'lat', 'lon']
+                    _op = 'data/weather_trace_observed.csv'
+                    with open(_op, 'w', newline='') as _f:
+                        _w = _csv.writer(_f)
+                        _w.writerow(_ocols)
+                        for r in _obs:
+                            _w.writerow([r.get(c, '') for c in _ocols])
+                    self._send_document(_op, caption=f"weather_trace_observed.csv ({len(_obs)} rows)")
+                    _wt_sent = True
+                if _fet:
+                    _fp = 'data/weather_trace_fetch.csv'
+                    with open(_fp, 'w', newline='') as _f:
+                        _w = _csv.writer(_f)
+                        _w.writerow(['ts', 'city', 'provider_peak_spread_c', 'null_members', 'sources'])
+                        for r in _fet:
+                            _nm = r.get('null_members') or []
+                            _w.writerow([r.get('ts', ''), r.get('city', ''),
+                                         r.get('provider_peak_spread_c', ''),
+                                         '|'.join(str(x) for x in _nm),
+                                         json.dumps(r.get('sources', {}), default=str)])
+                    self._send_document(_fp, caption=f"weather_trace_fetch.csv ({len(_fet)} rows)")
+                    _wt_sent = True
+                try:
+                    _wtp = _wt.trace_path()
+                    _wt.flush()
+                    if os.path.exists(_wtp) and os.path.getsize(_wtp) > 0:
+                        self._send_document(_wtp, caption="weather_trace.jsonl (raw)")
+                        _wt_sent = True
+                except Exception as _e:
+                    log.debug(f"weather_trace raw ship failed: {_e}")
+                try:
+                    self.send(_wt.summarize())
+                except Exception:
+                    pass
+        except Exception as _e:
+            log.debug(f"weather_trace export failed: {_e}")
         path = self._mae_mfe_path()
         recs = []
         try:
@@ -857,7 +922,7 @@ class TelegramBot:
             log.debug(f"data export csv failed: {e}")
             csv_path = None
         self.send(
-            f"📊 <b>Research dataset</b> — {len(recs)} closed positions with full "
+            f"📊 <b>Price-path dataset (secondary)</b> — {len(recs)} closed positions with full "
             f"price-path (MAE/MFE + dip crossings) and decision context "
             f"(entry, edge, grade, prob, size). Use it for what-if backtests."
         )
@@ -1174,15 +1239,17 @@ class TelegramBot:
         if not chunk:
             text += "No closed positions in this view.\n"
         cur_strat = None
+        idx = page * self._DONE_PAGE
         for p in chunk:
+            idx += 1
             # Group header + spacing whenever the strategy changes (unfiltered).
             if strat == 'all':
                 s = getattr(p, 'strategy', '') or '\u2014'
                 if s != cur_strat:
                     cur_strat = s
                     gw, gl, gr = strat_tot.get(s, (0, 0, 0.0))
-                    text += (f"\n\u2501\u2501 <b>{self._esc(self._short_strat(s))}</b> "
-                             f"\u00B7 {gw}W/{gl}L \u00B7 ${gr:+.2f} \u2501\u2501\n")
+                    text += (f"\n\U0001F4C2 <b>{self._esc(self._short_strat(s))}</b> "
+                             f"\u00B7 {gw}W/{gl}L \u00B7 ${gr:+.2f}\n")
             val = p.pnl or 0.0
             pe = '\u2705' if val > 0 else ('\u274C' if val < 0 else '\u2796')
             bought = p.entry_time.strftime('%m-%d %H:%M') if p.entry_time else '?'
@@ -1193,10 +1260,10 @@ class TelegramBot:
             box = getattr(p, 'cluster_box', '') or ''
             box_s = f" [{self._esc(box)}]" if box else ''
             text += (
-                f"{pe} <b>{self._esc(p.city)}</b> {name} \u00B7 {self._esc(p.strategy)}{box_s}\n"
+                f"{idx}. {pe} <b>{self._esc(p.city)}</b> {name} \u00B7 {self._esc(p.strategy)}{box_s}\n"
                 f"   {self._close_label(p)} | ${val:+.2f} ({p.roi_pct:+.0f}%)\n"
                 f"   bought {bought} @ ${p.entry_price:.3f} -> "
-                f"closed {closed_at} @ ${exit_px:.3f} | {p.shares:.0f}sh\n"
+                f"closed {closed_at} @ ${exit_px:.3f} | {p.shares:.0f}sh\n\n"
             )
         nav = []
         if page > 0:
@@ -1601,6 +1668,31 @@ class TelegramBot:
                                     edit_message_id=message_id)
             return
 
+        # Recovery restore: "rec:<filename>"
+        if data.startswith('rec:'):
+            fn = data.split(':', 1)[1]
+            self._answer_callback(callback_id, 'Recovering\u2026')
+            if not self.pm:
+                self.send("\u26A0\uFE0F Recovery unavailable.")
+                return
+            path = os.path.join('data/recover', fn)
+            try:
+                with open(path) as _f:
+                    snap = json.load(_f)
+                res = self.pm.recover_open_snapshot(snap)
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                self.send(
+                    f"\u2705 <b>Recovered</b> {res.get('added', 0)} position(s) "
+                    f"(skipped {res.get('skipped', 0)} dup/invalid). File consumed.\n"
+                    f"Run <code>/status</code> to verify against today's markets."
+                )
+            except Exception as e:
+                self.send(f"\u26A0\uFE0F Recover failed: {e}")
+            return
+
         # Settings tab switch: "st:<group_id>"
         if data.startswith('st:'):
             group = data.split(':', 1)[1]
@@ -1931,6 +2023,49 @@ class TelegramBot:
             self.send("\u267B\uFE0F <b>ML lock cleared.</b> The provider profile will "
                       "fall back to <code>ML_PROVIDER_PROFILE</code> (or auto-default) "
                       "on next restart. Failure counters reset. Trading untouched.")
+        elif cmd in ('/update', '/savepoint', '/snapshot'):
+            if not self.pm:
+                self.send("\u26A0\uFE0F Recovery unavailable -- position manager not wired.")
+            else:
+                try:
+                    import time as _time
+                    snap = self.pm.export_open_snapshot()
+                    os.makedirs('data/recover', exist_ok=True)
+                    fn = 'recover_' + _time.strftime('%Y%m%d_%H%M%S') + '.json'
+                    with open(os.path.join('data/recover', fn), 'w') as _f:
+                        json.dump(snap, _f, indent=2, default=str)
+                    n = snap.get('open_count', 0)
+                    bal = snap.get('paper_balance', 0.0)
+                    self.send(
+                        f"\U0001F4BE <b>Recovery point saved</b>\n"
+                        f"Captured {n} open position(s) + balance ${bal:.2f}, keyed "
+                        f"by market/condition id.\n"
+                        f"Use <code>/recover</code> to rebuild the REAL book."
+                    )
+                except Exception as e:
+                    self.send(f"\u26A0\uFE0F Recovery save failed: {e}")
+        elif cmd in ('/recover', '/restore'):
+            if not self.pm:
+                self.send("\u26A0\uFE0F Recovery unavailable -- position manager not wired.")
+            else:
+                try:
+                    _d = 'data/recover'
+                    _files = sorted([x for x in os.listdir(_d)
+                                     if x.startswith('recover_') and x.endswith('.json')],
+                                    reverse=True)[:8] if os.path.isdir(_d) else []
+                except Exception:
+                    _files = []
+                if not _files:
+                    self.send("\U0001F4ED No recovery points yet. Run <code>/update</code> first.")
+                else:
+                    rows = [[{'text': '\u267B\uFE0F ' + x.replace('recover_', '').replace('.json', ''),
+                              'callback_data': 'rec:' + x}] for x in _files]
+                    self.send(
+                        "\u267B\uFE0F <b>Recover positions</b>\n"
+                        "Pick a recovery point to rebuild the REAL open book "
+                        "(matched by market/condition id, duplicates skipped):",
+                        reply_markup={'inline_keyboard': rows},
+                    )
         elif cmd == '/redeem':
             if self.pm:
                 count = self.pm.redeem_all_winning()
@@ -2005,6 +2140,8 @@ class TelegramBot:
                 "/mlsetup [name] — list ML providers / lock one (openai, anthropic, gemini, ...)\n"
                 "/mlreset — unlock the provider + clear ML failure counters\n"
                 "/redeem — redeem winning positions\n"
+                "/update \u2014 save a recovery point of open positions (by market id)\n"
+                "/recover \u2014 rebuild the REAL open book from a saved point\n"
                 "/reserve [USD] — view/set untouchable cash reserve\n"
                 "/takeout [USD|withdraw] — set win-skim target / withdraw the pool\n"
                 "/info KEY — explain any setting (effect + range)\n"

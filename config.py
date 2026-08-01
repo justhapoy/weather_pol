@@ -263,7 +263,32 @@ class Config:
         'late_observed_yes': float(os.getenv('SIZE_MULT_LATE_OBSERVED_YES', '0.6')),
         'late_observed_no': float(os.getenv('SIZE_MULT_LATE_OBSERVED_NO', '1.3')),
         'quick_flip': float(os.getenv('SIZE_MULT_QUICK_FLIP', '1.0')),
+        # golden_no = audited fusion strategy (overlay/golden_gate.py). Skims the
+        # Golden-Filter subset of late_observed_no + peaker_cool_basket into a
+        # separately-named, boosted strategy. Same 1.3 lean as late_observed_no
+        # so the bot up-sizes toward the +$332 / 68% WR core. Env overrides.
+        'golden_no': float(os.getenv('SIZE_MULT_GOLDEN_NO', '1.3')),
     }
+
+    # === GOLDEN FILTER + LATE-OBSERVED TIMING (overlay/golden_gate.py) =====
+    # Audited fusion strategy: skims the durable winning core out of
+    # late_observed_no + peaker_cool_basket into a separately-named
+    # 'golden_no' strategy. Live-tunable from /settings; env overrides.
+    # GOLDEN_NO_ENABLED off => identical pre-golden behaviour. Timing toggles
+    # gate late_observed by days-to-resolution (same-day loses -> OFF).
+    GOLDEN_NO_ENABLED = os.getenv('GOLDEN_NO_ENABLED', '1') == '1'
+    GOLDEN_NO_SIDE_ONLY = os.getenv('GOLDEN_NO_SIDE_ONLY', '1') == '1'
+    GOLDEN_MIN_DAYS_TO_RES = float(os.getenv('GOLDEN_MIN_DAYS_TO_RES', '1.0'))
+    GOLDEN_ENTRY_MIN = float(os.getenv('GOLDEN_ENTRY_MIN', '0.50'))
+    GOLDEN_ENTRY_MAX = float(os.getenv('GOLDEN_ENTRY_MAX', '0.80'))
+    GOLDEN_EDGE_MIN = float(os.getenv('GOLDEN_EDGE_MIN', '0.10'))
+    GOLDEN_EDGE_MAX = float(os.getenv('GOLDEN_EDGE_MAX', '0.50'))
+    GOLDEN_GRADE_MAX = float(os.getenv('GOLDEN_GRADE_MAX', '0.90'))
+    LATE_OBS_TIMING_SAMEDAY_ENABLED = os.getenv('LATE_OBS_TIMING_SAMEDAY_ENABLED', '0') == '1'
+    LATE_OBS_TIMING_1D_ENABLED = os.getenv('LATE_OBS_TIMING_1D_ENABLED', '1') == '1'
+    LATE_OBS_TIMING_2D_ENABLED = os.getenv('LATE_OBS_TIMING_2D_ENABLED', '1') == '1'
+    LATE_OBS_TIMING_3D_ENABLED = os.getenv('LATE_OBS_TIMING_3D_ENABLED', '1') == '1'
+    LATE_OBS_FETCH_AFTER_NEXT_DAY = os.getenv('LATE_OBS_FETCH_AFTER_NEXT_DAY', '1') == '1'
 
     # ML SIZING/VETO INFLUENCE - the ML engine (ml/decision_engine.py) is now
     # actually consulted on the trade path (it was wired but never called).

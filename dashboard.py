@@ -563,6 +563,29 @@ class WeatherBot:
         except Exception as _e:
             log.debug(f"city_throttle skipped: {_e}")
 
+        # (4) golden_gate: NEW fusion overlay (overlay/golden_gate.py). Two jobs,
+        #     both fully fail-open and additive (do NOT touch other strategies):
+        #       a. TIMING: drop a late_observed leg whose days-to-resolution
+        #          bucket toggle (same-day / 1d / 2d / 3d) is switched OFF.
+        #       b. GOLDEN: if the leg passes the audited Golden Filter, RE-TAG it
+        #          to 'golden_no' so it sizes with the golden boost and shows as
+        #          a separately-named strategy. GOLDEN_NO_ENABLED off => unchanged.
+        try:
+            from overlay import golden_gate as _gg
+            _ok, _why = _gg.timing_allowed(strategy, resolution_time)
+            if not _ok:
+                self._funnel['toggle_off'] += 1
+                log.info(f"   \u26d4 TIMING {strategy}:{bucket_label[:18]} \u2014 {_why}")
+                return None
+            _is_gold, _greason = _gg.classify_golden(
+                strategy, entry_price, edge, grade, resolution_time,
+                bucket_label=bucket_label, side_hint=signal)
+            if _is_gold and strategy != _gg.GOLDEN_TAG:
+                log.info(f"   \U0001F947 {_greason} \u2014 re-tag {strategy} -> golden_no")
+                strategy = _gg.GOLDEN_TAG
+        except Exception as _e:
+            log.debug(f"golden_gate skipped: {_e}")
+
         if grade is None:
             grade = Config.GRADE_NEUTRAL
         if early_exit_price is None:
@@ -918,13 +941,27 @@ class WeatherBot:
             not in_lock_window or getattr(Config, 'LATE_OBSERVED_TRADE_DECIDED', True)
         ):
             mode = 'low' if 'low' in (market.market_type or '').lower() else 'high'
-            observed_state = None
+            # REQUEST REDUCER (overlay/golden_gate.py): late_observed_no only
+            # trades markets resolving AFTER the next day (same-day is a proven
+            # loser, OFF by default). When same-day is off, skip the Open-Meteo
+            # observed-state fetch for a same-day market entirely. Fail-open.
+            _obs_fetch_ok = True
             try:
-                observed_state = self.observed.get_state(
-                    lat, lon, market.measurement_date, mode
-                )
-            except Exception as e:
-                log.debug(f"observed-state fetch failed {city}: {e}")
+                from overlay import golden_gate as _gg
+                if not _gg.late_observed_should_fetch('late_observed_no', market.resolution_time):
+                    _obs_fetch_ok = False
+                    self._funnel['toggle_off'] += 1
+                    log.info(f"   \u23ed\ufe0f  LATE-OBS skip-fetch {city} {mode} \u2014 same-day market")
+            except Exception as _e:
+                log.debug(f"late_observed fetch-reducer skipped: {_e}")
+            observed_state = None
+            if _obs_fetch_ok:
+                try:
+                    observed_state = self.observed.get_state(
+                        lat, lon, market.measurement_date, mode
+                    )
+                except Exception as e:
+                    log.debug(f"observed-state fetch failed {city}: {e}")
             if observed_state is None:
                 # The PRIMARY edge needs observed station data. Make the silence
                 # visible: no data = no observed extreme yet (early in the local
