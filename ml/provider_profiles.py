@@ -243,3 +243,44 @@ def gemini_url(base_url: str, model: str, api_key: str) -> str:
     if api_key:
         u += ('&' if '?' in u else '?') + f'key={api_key}'
     return u
+
+
+# ---- live model discovery (added 2026-08-03 for the /mlsetup wizard) ---- #
+def discover_models(base_url, api_key='', profile_name=None, timeout=8):
+    """GET a provider's models endpoint; return (ok, models, error).
+    Fail-open: any network/parse issue returns (False, [], reason). Uses the
+    profile's models_url()/parse_models() so it works for OpenAI, any
+    OpenAI-compatible gateway, Anthropic, Gemini, Cohere and Ollama."""
+    prof = get_profile(profile_name)
+    try:
+        import requests  # lazy import keeps this module import-light + pure
+    except Exception as e:  # pragma: no cover
+        return (False, [], 'requests unavailable: %s' % e)
+    url = prof.models_url(base_url, api_key)
+    if not url:
+        return (False, [], 'profile %s exposes no models endpoint' % prof.name)
+    try:
+        r = requests.get(url, headers=prof.headers(api_key), timeout=timeout)
+        if r.status_code != 200:
+            return (False, [], 'HTTP %s: %s' % (r.status_code, (r.text or '')[:80]))
+        models = prof.parse_models(r.json())
+        if models:
+            return (True, models, '')
+        return (False, [], 'no models in response')
+    except Exception as e:
+        return (False, [], str(e)[:100])
+
+
+def autodetect_profile(base_url, api_key='', timeout=8):
+    """Probe every known profile's models endpoint one-by-one and return the
+    first that answers. Returns (profile_name, models, tried) where tried is a
+    list of (name, ok, note) for a readable report; profile_name is '' if none
+    worked. Backs the wizard's 'I don't know -- try all' option."""
+    tried = []
+    for name in PROFILES:
+        ok, models, err = discover_models(base_url, api_key, name, timeout=timeout)
+        note = ('%d models' % len(models)) if ok else (err or 'no')
+        tried.append((name, ok, note))
+        if ok and models:
+            return (name, models, tried)
+    return ('', [], tried)

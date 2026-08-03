@@ -208,13 +208,16 @@ STR_KEYS: Dict[str, List[str]] = {
     # set_value accepts it; FREE_TEXT_STR_KEYS below makes _coerce store the
     # raw string (including '') rather than snapping to a choice.
     'ML_LOCKED_PROFILE': [''],
+    # ML endpoint base URL -- free text, set via the /mlsetup wizard. 1-item
+    # list keeps the v[0] default-fallback in _persist()/str_snapshot() safe.
+    'ML_API_URL': [''],
 }
 
 # STR keys that accept FREE TEXT (not a fixed choice list) — e.g. the overlay
 # city lists. For these, /set stores the raw string. The advanced-settings
 # overlay registers such keys here and gives them a 1-item choices list so the
 # v[0] default fallback in str_snapshot()/_persist() stays safe.
-FREE_TEXT_STR_KEYS = {'ML_LOCKED_PROFILE'}
+FREE_TEXT_STR_KEYS = {'ML_LOCKED_PROFILE', 'ML_API_URL', 'ML_MODEL', 'ML_ANALYSIS_MODEL'}
 
 # -- Tabs for the Telegram /settings panel. Each group lists the keys (toggles
 # and/or gates) shown when that tab is active, in display order. ------------

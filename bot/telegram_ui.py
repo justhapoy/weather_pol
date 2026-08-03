@@ -53,7 +53,8 @@ class TelegramBot:
         self._restart_pending = False
         # Req-29 settings UX: capture typed input (e.g. a new starting balance),
         # and log human-readable changes so the OK button can summarise them.
-        self._awaiting = None          # None | 'balance'
+        self._awaiting = None          # None | 'balance' | 'ml_url' | 'recover_upload'
+        self._ml_wiz = {}              # transient /mlsetup wizard state
         self._session_changes = []     # ["STARTING_BALANCE = 300", ...]
         # Req-29 mlanalysis: optional ML engine handle (set by the dashboard via
         # attach_ml); None keeps mlanalysis on its heuristic fallback.
@@ -1476,6 +1477,11 @@ class TelegramBot:
                 if chat_id != self.chat_id:
                     continue
 
+                doc = msg.get('document')
+                if doc:
+                    self._handle_document(doc)
+                    continue
+
                 self._handle_command(text)
         except Exception:
             pass
@@ -1668,6 +1674,32 @@ class TelegramBot:
                                     edit_message_id=message_id)
             return
 
+        # Recover menu choice: "recv:files" | "recv:upload"
+        if data.startswith('recv:'):
+            choice = data.split(':', 1)[1]
+            self._answer_callback(callback_id)
+            if choice == 'files':
+                self._send_recover_file_list()
+            elif choice == 'upload':
+                self._awaiting = 'recover_upload'
+                self.send(
+                    "\U0001F4E4 <b>Upload recovery file</b>\n"
+                    "Send me the <code>recover_*.json</code> file (as a document) "
+                    "that /update gave you. I'll rebuild the REAL open book from it "
+                    "(matched by market/condition id, duplicates skipped)."
+                )
+            return
+
+        # /mlsetup wizard: provider pick "mlp:<name>" or "mlp:__all__"
+        if data.startswith('mlp:'):
+            self._mlwiz_pick_provider(data.split(':', 1)[1], callback_id)
+            return
+
+        # /mlsetup wizard: model pick "mlm:<slot>:<idx>" (d=decision a=analysis)
+        if data.startswith('mlm:'):
+            self._mlwiz_pick_model(data, callback_id)
+            return
+
         # Recovery restore: "rec:<filename>"
         if data.startswith('rec:'):
             fn = data.split(':', 1)[1]
@@ -1777,6 +1809,15 @@ class TelegramBot:
         from bot import settings_store
         what = self._awaiting
         self._awaiting = None
+        if what == 'ml_url':
+            self._mlwiz_set_url(text)
+            return
+        if what == 'recover_upload':
+            self._awaiting = 'recover_upload'
+            self.send("\U0001F4CE Please <b>upload the recovery .json file</b> as a "
+                      "document (the one /update sent you), or tap a saved point "
+                      "via /recover.")
+            return
         if what == 'balance':
             raw = text.strip().lstrip('$').replace(',', '')
             try:
@@ -1847,6 +1888,265 @@ class TelegramBot:
         ]]}
         self.send(summary + bal_note + "\n\nReady — <b>settings changed, start bot now.</b>",
                   reply_markup=kb)
+
+    # ==============================================================
+    # ML AUTO-SETUP WIZARD + FILE-BASED RECOVERY (added 2026-08-03)
+    # ==============================================================
+    def _download_document(self, file_id):
+        """getFile + fetch bytes; return decoded text or None (fail-open)."""
+        try:
+            r = self._session.get(self.base_url + '/getFile',
+                                  params={'file_id': file_id}, timeout=15)
+            if r.status_code != 200:
+                return None
+            fp = (r.json().get('result') or {}).get('file_path')
+            if not fp:
+                return None
+            file_url = self.base_url.replace('/bot', '/file/bot', 1) + '/' + fp
+            d = self._session.get(file_url, timeout=30)
+            if d.status_code != 200:
+                return None
+            return d.content.decode('utf-8', 'replace')
+        except Exception:
+            return None
+
+    def _handle_document(self, doc):
+        """A document arrived; only meaningful while awaiting a recovery upload."""
+        if self._awaiting != 'recover_upload':
+            self.send("\U0001F4CE Got a file, but I wasn't expecting one. Use "
+                      "<code>/recover</code> -> \U0001F4E4 Upload to restore positions.")
+            return
+        self._awaiting = None
+        if not self.pm:
+            self.send("\u26A0\uFE0F Recovery unavailable -- position manager not wired.")
+            return
+        name = doc.get('file_name', 'upload.json')
+        raw = self._download_document(doc.get('file_id', ''))
+        if not raw:
+            self.send("\u26A0\uFE0F Couldn't download that file. Try /recover -> Upload again.")
+            return
+        try:
+            snap = json.loads(raw)
+        except Exception as e:
+            self.send("\u26A0\uFE0F That isn't valid JSON (<code>%s</code>). Upload the "
+                      "<code>recover_*.json</code> file /update sent you."
+                      % self._esc(str(e)[:80]))
+            return
+        try:
+            res = self.pm.recover_open_snapshot(snap)
+            self.send(
+                "\u2705 <b>Recovered from upload</b> (%s)\n"
+                "Added %d position(s), skipped %d dup/invalid.\n"
+                "Run <code>/status</code> to verify against today's markets."
+                % (self._esc(name), res.get('added', 0), res.get('skipped', 0))
+            )
+        except Exception as e:
+            self.send("\u26A0\uFE0F Recover failed: <code>%s</code>" % self._esc(str(e)[:100]))
+
+    def _send_recover_menu(self):
+        """Two-source recovery picker: saved files vs uploaded file."""
+        self.send(
+            "\u267B\uFE0F <b>Recover positions</b>\n"
+            "Rebuild the REAL open book (matched by market/condition id, "
+            "duplicates skipped). Choose a source:",
+            reply_markup={'inline_keyboard': [
+                [{'text': '\U0001F4C2 From saved files', 'callback_data': 'recv:files'}],
+                [{'text': '\U0001F4E4 Upload a file', 'callback_data': 'recv:upload'}],
+            ]},
+        )
+
+    def _send_recover_file_list(self):
+        """List on-disk recover_*.json points as restore buttons."""
+        try:
+            _d = 'data/recover'
+            _files = sorted([x for x in os.listdir(_d)
+                             if x.startswith('recover_') and x.endswith('.json')],
+                            reverse=True)[:8] if os.path.isdir(_d) else []
+        except Exception:
+            _files = []
+        if not _files:
+            self.send("\U0001F4ED No saved recovery files on this deploy. Run "
+                      "<code>/update</code> first, or use \U0001F4E4 Upload if you "
+                      "kept a downloaded <code>recover_*.json</code>.")
+            return
+        rows = [[{'text': '\u267B\uFE0F ' + x.replace('recover_', '').replace('.json', ''),
+                  'callback_data': 'rec:' + x}] for x in _files]
+        self.send(
+            "\u267B\uFE0F <b>Saved recovery points</b>\n"
+            "Pick one to rebuild the REAL open book:",
+            reply_markup={'inline_keyboard': rows},
+        )
+
+    # ----- /mlsetup interactive wizard --------------------------------------
+    def _mlwiz_start(self):
+        """Step 1: require the env key, then ask for the endpoint."""
+        key = getattr(Config, 'ML_API_KEY', '') or ''
+        if not key:
+            self.send(
+                "\U0001F511 <b>No ML_API_KEY found.</b>\n"
+                "Set <code>ML_API_KEY</code> in your Railway env and restart, then run "
+                "<code>/mlsetup</code> again. (The key stays in env -- I never store it.)"
+            )
+            return
+        self._ml_wiz = {}
+        self._awaiting = 'ml_url'
+        cur = getattr(Config, 'ML_API_URL', '') or ''
+        self.send(
+            "\U0001F9E0 <b>ML auto-setup</b> (step 1/3)\n"
+            "Send the <b>API base URL / endpoint</b> to use. Examples:\n"
+            "  \u2022 <code>https://api.openai.com/v1</code>\n"
+            "  \u2022 <code>https://api.anthropic.com</code>\n"
+            "  \u2022 your gateway URL (Groq / Together / OpenRouter / vLLM)\n\n"
+            + ("Current: <code>%s</code>\n" % self._esc(cur) if cur else "")
+            + "Or type <code>default</code> to use the provider's own default base URL."
+        )
+
+    def _mlwiz_set_url(self, text):
+        """Step 2: store the endpoint and show the provider picker."""
+        t = (text or '').strip()
+        if t.lower() in ('default', 'none', '-'):
+            t = ''
+        self._ml_wiz['url'] = t
+        rows = [
+            [{'text': 'OpenAI', 'callback_data': 'mlp:openai'},
+             {'text': 'Anthropic', 'callback_data': 'mlp:anthropic'}],
+            [{'text': 'Gemini', 'callback_data': 'mlp:google_gemini'},
+             {'text': 'OpenAI-compatible', 'callback_data': 'mlp:openai_compatible'}],
+            [{'text': 'Cohere', 'callback_data': 'mlp:cohere'},
+             {'text': 'Ollama', 'callback_data': 'mlp:ollama'}],
+            [{'text': '\U0001F50D I don\u2019t know -- try all', 'callback_data': 'mlp:__all__'}],
+        ]
+        self.send(
+            "\U0001F9E0 <b>ML auto-setup</b> (step 2/3)\n"
+            "Endpoint: <code>%s</code>\n\n"
+            "Which provider is this? I'll fetch the live model list. Not sure? "
+            "Tap <b>Try all</b> and I'll probe each one." % self._esc(t or '(provider default)'),
+            reply_markup={'inline_keyboard': rows},
+        )
+
+    def _mlwiz_pick_provider(self, sel, callback_id):
+        """Step 3a: discover models for the chosen provider (or auto-detect)."""
+        from ml import provider_profiles as _pp
+        url = self._ml_wiz.get('url', '')
+        key = getattr(Config, 'ML_API_KEY', '') or ''
+        self._answer_callback(callback_id, 'Discovering models\u2026')
+        if sel == '__all__':
+            self.send("\U0001F50D Probing every provider against your endpoint\u2026 one moment.")
+            name, models, tried = _pp.autodetect_profile(url, key)
+            report = "\n".join("  %s %s -- %s" % (('\u2705' if ok else '\u274C'),
+                                                  self._esc(n), self._esc(note))
+                               for n, ok, note in tried)
+            if not name:
+                self.send("\u274C <b>Auto-detect failed</b> -- no provider answered.\n" + report +
+                          "\n\nCheck the endpoint + that <code>ML_API_KEY</code> is set in env, "
+                          "then run <code>/mlsetup</code> again.")
+                return
+            self._ml_wiz['profile'] = name
+            self._ml_wiz['models'] = models
+            self.send("\u2705 <b>Detected provider:</b> <code>%s</code> (%d models)\n%s"
+                      % (self._esc(name), len(models), report))
+        else:
+            if sel not in _pp.PROFILES:
+                self.send("\u274C Unknown provider.")
+                return
+            ok, models, err = _pp.discover_models(url, key, sel)
+            if not ok:
+                self.send("\u274C <b>Couldn't list models</b> for <code>%s</code>:\n"
+                          "<code>%s</code>\n\nFixes: verify the endpoint + "
+                          "<code>ML_API_KEY</code> in env, or pick \U0001F50D Try all."
+                          % (self._esc(sel), self._esc(err)))
+                return
+            self._ml_wiz['profile'] = sel
+            self._ml_wiz['models'] = models
+        self._ml_wiz['slot'] = 'd'
+        self.send(
+            "\U0001F9E0 <b>Wire model 1/2 -- DECISION model</b>\n"
+            "(used for live trade decisions). Pick one:",
+            reply_markup=self._mlwiz_model_kb('d'),
+        )
+
+    def _mlwiz_model_kb(self, slot):
+        """Build a 2-per-row keyboard of discovered models (first 24)."""
+        models = self._ml_wiz.get('models', [])[:24]
+        rows, row = [], []
+        for i, m in enumerate(models):
+            row.append({'text': str(m)[:24], 'callback_data': 'mlm:%s:%d' % (slot, i)})
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        return {'inline_keyboard': rows}
+
+    def _mlwiz_pick_model(self, data, callback_id):
+        """Step 3b: record the chosen decision/analysis model, then finalize."""
+        p = data.split(':')
+        slot = p[1] if len(p) > 1 else ''
+        try:
+            idx = int(p[2])
+        except (IndexError, ValueError):
+            self._answer_callback(callback_id)
+            return
+        models = self._ml_wiz.get('models', [])
+        if idx < 0 or idx >= len(models):
+            self._answer_callback(callback_id, 'stale -- rerun /mlsetup')
+            return
+        chosen = models[idx]
+        if slot == 'd':
+            self._ml_wiz['decision'] = chosen
+            self._ml_wiz['slot'] = 'a'
+            self._answer_callback(callback_id, 'Decision: ' + str(chosen)[:30])
+            self.send(
+                "\U0001F9E0 <b>Wire model 2/2 -- ANALYSIS model</b>\n"
+                "(used for /mlanalysis + position review). Pick one:",
+                reply_markup=self._mlwiz_model_kb('a'),
+            )
+        elif slot == 'a':
+            self._ml_wiz['analysis'] = chosen
+            self._answer_callback(callback_id, 'Analysis: ' + str(chosen)[:30])
+            self._mlwiz_finalize()
+
+    def _mlwiz_finalize(self):
+        """Persist the wizard result + live re-init the engine + self-test."""
+        from bot import settings_store
+        w = self._ml_wiz
+        prof = w.get('profile', '')
+        url = w.get('url', '')
+        dec = w.get('decision', '')
+        ana = w.get('analysis', '') or dec
+        if url:
+            settings_store.set_value('ML_API_URL', url)
+        settings_store.set_value('ML_PROVIDER_PROFILE', prof)
+        settings_store.set_value('ML_LOCKED_PROFILE', prof)
+        settings_store.set_value('ML_MODEL', dec)
+        settings_store.set_value('ML_ANALYSIS_MODEL', ana)
+        settings_store.set_value('ML_ENABLED', True)
+        live = ''
+        try:
+            from ml.decision_engine import MLDecisionEngine
+            eng = MLDecisionEngine()
+            self.attach_ml(eng)
+            r = eng.self_test()
+            if r.get('ok'):
+                live = "\u2705 <b>Live test PASSED</b> -- model replied in %ss." % r.get('latency_s')
+            else:
+                live = ("\u26A0\uFE0F Live test not passing yet: <code>%s</code>\n"
+                        "Settings are saved; run <code>/mltest</code> or restart if needed."
+                        % self._esc(str(r.get('reason') or r.get('error') or 'unknown')[:120]))
+        except Exception as e:
+            live = "\u26A0\uFE0F Saved, but live re-init failed: <code>%s</code>" % self._esc(str(e)[:100])
+        self._ml_wiz = {}
+        self.send(
+            "\u2705 <b>ML wired</b>\n"
+            "Provider: <code>%s</code>\n"
+            "Endpoint: <code>%s</code>\n"
+            "Decision model: <code>%s</code>\n"
+            "Analysis model: <code>%s</code>\n%s\n"
+            "If the trading loop was already running, restart so every component "
+            "uses the new models. Status: <code>/mlstatus</code>."
+            % (self._esc(prof), self._esc(url or '(provider default)'),
+               self._esc(dec), self._esc(ana), live)
+        )
 
     def _handle_command(self, text: str):
         """Handle incoming bot commands."""
@@ -1980,7 +2280,7 @@ class TelegramBot:
                 self.send(f"\u26A0\uFE0F profiles unavailable: {e}")
                 return
             from bot import settings_store
-            if len(parts) >= 2:
+            if len(parts) >= 2 and parts[1].strip().lower() != 'list':
                 sel = parts[1].strip().lower()
                 if sel not in _pp.PROFILES:
                     names = ', '.join(_pp.PROFILES.keys())
@@ -1997,7 +2297,7 @@ class TelegramBot:
                     f"<code>ML_MODEL</code> and restart, then run <code>/mltest</code>.\n"
                     f"Undo with <code>/mlreset</code>."
                 )
-            else:
+            elif len(parts) >= 2:
                 cur = (getattr(self.ml, 'profile', None).name if self.ml and getattr(self.ml, 'profile', None) else '\u2014')
                 lines = ["\U0001F9E0 <b>ML provider profiles</b>",
                          f"Active: <code>{self._esc(cur)}</code>\n",
@@ -2009,6 +2309,8 @@ class TelegramBot:
                              "(e.g. <code>/mlsetup openai</code>). Then set "
                              "<code>ML_API_URL</code>/<code>ML_API_KEY</code>/<code>ML_MODEL</code> and <code>/mltest</code>.")
                 self.send("\n".join(lines))
+            else:
+                self._mlwiz_start()
         elif cmd == '/mlreset':
             # Clear the locked profile + reset failure counters so the ML layer
             # re-detects cleanly on next restart. Never touches trading.
@@ -2042,30 +2344,19 @@ class TelegramBot:
                         f"by market/condition id.\n"
                         f"Use <code>/recover</code> to rebuild the REAL book."
                     )
+                    self._send_document(
+                        os.path.join('data/recover', fn),
+                        caption=('recovery snapshot: %d open, $%.2f. KEEP THIS FILE -- '
+                                 'a new Railway deploy wipes the on-disk copy, so you '
+                                 'can re-upload it via /recover -> Upload.' % (n, bal)),
+                    )
                 except Exception as e:
                     self.send(f"\u26A0\uFE0F Recovery save failed: {e}")
         elif cmd in ('/recover', '/restore'):
             if not self.pm:
                 self.send("\u26A0\uFE0F Recovery unavailable -- position manager not wired.")
             else:
-                try:
-                    _d = 'data/recover'
-                    _files = sorted([x for x in os.listdir(_d)
-                                     if x.startswith('recover_') and x.endswith('.json')],
-                                    reverse=True)[:8] if os.path.isdir(_d) else []
-                except Exception:
-                    _files = []
-                if not _files:
-                    self.send("\U0001F4ED No recovery points yet. Run <code>/update</code> first.")
-                else:
-                    rows = [[{'text': '\u267B\uFE0F ' + x.replace('recover_', '').replace('.json', ''),
-                              'callback_data': 'rec:' + x}] for x in _files]
-                    self.send(
-                        "\u267B\uFE0F <b>Recover positions</b>\n"
-                        "Pick a recovery point to rebuild the REAL open book "
-                        "(matched by market/condition id, duplicates skipped):",
-                        reply_markup={'inline_keyboard': rows},
-                    )
+                self._send_recover_menu()
         elif cmd == '/redeem':
             if self.pm:
                 count = self.pm.redeem_all_winning()
