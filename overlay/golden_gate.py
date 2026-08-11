@@ -57,6 +57,7 @@ SETTING_DEFAULTS = {
     "GOLDEN_EDGE_MAX": 0.50,
     "GOLDEN_GRADE_MAX": 0.90,
     "GOLDEN_NO_SIDE_ONLY": True,
+    "GOLDEN_NO_SAMEDAY_ENABLED": False,
     "LATE_OBS_TIMING_SAMEDAY_ENABLED": False,
     "LATE_OBS_TIMING_1D_ENABLED": True,
     "LATE_OBS_TIMING_2D_ENABLED": True,
@@ -203,7 +204,7 @@ def classify_golden(strategy, entry_price, edge, grade, resolution_time,
         days = days_to_resolution(resolution_time)
         if days is None:
             return False, "no resolution time"
-        if days < _f("GOLDEN_MIN_DAYS_TO_RES", 1.0):
+        if days < _f("GOLDEN_MIN_DAYS_TO_RES", 1.0) and not _b("GOLDEN_NO_SAMEDAY_ENABLED", False):
             return False, "same-day ({0:.2f}d) not golden".format(days)
         return True, "GOLDEN {0} p{1:.2f} e{2:+.2f} {3:.1f}d".format(tag, p, e, days)
     except Exception:

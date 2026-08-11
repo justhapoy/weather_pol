@@ -29,6 +29,29 @@ from logger import log
 if not hasattr(Config, 'QUICK_FLIP_HARD_STOP_ENABLED'):
     Config.QUICK_FLIP_HARD_STOP_ENABLED = os.getenv('QUICK_FLIP_HARD_STOP_ENABLED', '1') == '1'
 
+# Req-P3/P2b/P1/P2: default the new tunables on Config so the panel + getattr()
+# defaults agree even before any persisted override loads.
+_NEW_DEFAULTS = {
+    'EXPORT_PERIODIC_ENABLED': os.getenv('EXPORT_PERIODIC_ENABLED', '0') == '1',
+    'EXPORT_PERIODIC_HOURS': int(os.getenv('EXPORT_PERIODIC_HOURS', '6')),
+    'EXPORT_DISK_GUARD_MB': int(os.getenv('EXPORT_DISK_GUARD_MB', '400')),
+    'P2B_ENTRY_CEILING': float(os.getenv('P2B_ENTRY_CEILING', '0.90')),
+    'P2B_MIN_ROOM_USD': float(os.getenv('P2B_MIN_ROOM_USD', '0.10')),
+    'P2B_FORCE_EXIT_ENABLED': os.getenv('P2B_FORCE_EXIT_ENABLED', '1') == '1',
+    'PAPER_EXIT_SLIPPAGE_PCT': float(os.getenv('PAPER_EXIT_SLIPPAGE_PCT', '1.5')),
+    'PHANTOM_GUARD_GOLDEN_ONLY': os.getenv('PHANTOM_GUARD_GOLDEN_ONLY', '1') == '1',
+    'GOLDEN_NO_SAMEDAY_ENABLED': os.getenv('GOLDEN_NO_SAMEDAY_ENABLED', '0') == '1',
+    'GOLDEN_MIN_DAYS_TO_RES': float(os.getenv('GOLDEN_MIN_DAYS_TO_RES', '1.0')),
+    'GOLDEN_ENTRY_MIN': float(os.getenv('GOLDEN_ENTRY_MIN', '0.50')),
+    'GOLDEN_ENTRY_MAX': float(os.getenv('GOLDEN_ENTRY_MAX', '0.80')),
+    'GOLDEN_EDGE_MIN': float(os.getenv('GOLDEN_EDGE_MIN', '0.10')),
+    'GOLDEN_EDGE_MAX': float(os.getenv('GOLDEN_EDGE_MAX', '0.50')),
+    'GOLDEN_GRADE_MAX': float(os.getenv('GOLDEN_GRADE_MAX', '0.90')),
+}
+for _k, _v in _NEW_DEFAULTS.items():
+    if not hasattr(Config, _k):
+        setattr(Config, _k, _v)
+
 SETTINGS_PATH = 'data/runtime_settings.json'
 
 # -- On/off toggles exposed to Telegram (tick boxes) ----------------------
@@ -68,6 +91,10 @@ BOOL_KEYS = [
     'LATE_OBS_TIMING_SAMEDAY_ENABLED', 'LATE_OBS_TIMING_1D_ENABLED',
     'LATE_OBS_TIMING_2D_ENABLED', 'LATE_OBS_TIMING_3D_ENABLED',
     'LATE_OBS_FETCH_AFTER_NEXT_DAY',
+    # P3 export + P2b/P1 per-strategy + fill-model toggles
+    'EXPORT_PERIODIC_ENABLED',
+    'P2B_FORCE_EXIT_ENABLED', 'PHANTOM_GUARD_GOLDEN_ONLY',
+    'GOLDEN_NO_SAMEDAY_ENABLED',
 ]
 
 # -- Numeric gates: key -> (min, max, step, is_int) ---------------------
@@ -193,6 +220,20 @@ NUM_KEYS: Dict[str, tuple] = {
     'GOLDEN_EDGE_MIN':              (0.0, 1.0, 0.05, False),
     'GOLDEN_EDGE_MAX':              (0.0, 1.0, 0.05, False),
     'GOLDEN_GRADE_MAX':             (0.0, 1.0, 0.05, False),
+    # P3 data export + disk guard
+    'EXPORT_PERIODIC_HOURS':        (1, 48, 1, True),
+    'EXPORT_DISK_GUARD_MB':         (50, 5000, 50, True),
+    # P2b late_observed_no entry gate + P2 exit slippage model
+    'P2B_ENTRY_CEILING':            (0.50, 0.99, 0.01, False),
+    'P2B_MIN_ROOM_USD':             (0.00, 0.50, 0.01, False),
+    'PAPER_EXIT_SLIPPAGE_PCT':      (0.0, 10.0, 0.5, False),
+    # golden_no own knobs (split from late-observed so each is tunable)
+    'GOLDEN_MIN_DAYS_TO_RES':       (0.0, 7.0, 0.5, False),
+    'GOLDEN_ENTRY_MIN':             (0.01, 0.99, 0.01, False),
+    'GOLDEN_ENTRY_MAX':             (0.05, 0.99, 0.01, False),
+    'GOLDEN_EDGE_MIN':              (0.00, 0.50, 0.01, False),
+    'GOLDEN_EDGE_MAX':              (0.00, 0.90, 0.01, False),
+    'GOLDEN_GRADE_MAX':             (0.00, 1.00, 0.05, False),
 }
 
 # -- String/choice settings: key -> list of allowed values (first = default) --
@@ -315,6 +356,18 @@ GROUPS: List[dict] = [
         'LATE_OBS_TIMING_SAMEDAY_ENABLED', 'LATE_OBS_TIMING_1D_ENABLED',
         'LATE_OBS_TIMING_2D_ENABLED', 'LATE_OBS_TIMING_3D_ENABLED',
         'LATE_OBS_FETCH_AFTER_NEXT_DAY',
+    ]},
+    {'id': 'export', 'tab': 'Export', 'title': 'Data Export & Disk', 'keys': [
+        'EXPORT_PERIODIC_ENABLED', 'EXPORT_PERIODIC_HOURS', 'EXPORT_DISK_GUARD_MB',
+    ]},
+    {'id': 'goldentune', 'tab': 'Golden No', 'title': 'Golden-No strategy (own knobs)', 'keys': [
+        'GOLDEN_NO_ENABLED', 'GOLDEN_NO_SIDE_ONLY', 'GOLDEN_NO_SAMEDAY_ENABLED',
+        'GOLDEN_MIN_DAYS_TO_RES', 'GOLDEN_ENTRY_MIN', 'GOLDEN_ENTRY_MAX',
+        'GOLDEN_EDGE_MIN', 'GOLDEN_EDGE_MAX', 'GOLDEN_GRADE_MAX',
+    ]},
+    {'id': 'p2btune', 'tab': 'Observed-No fix', 'title': 'Late-observed-no WR->profit + fill model', 'keys': [
+        'P2B_ENTRY_CEILING', 'P2B_MIN_ROOM_USD', 'P2B_FORCE_EXIT_ENABLED',
+        'PAPER_EXIT_SLIPPAGE_PCT', 'PHANTOM_GUARD_GOLDEN_ONLY',
     ]},
 ]
 

@@ -252,6 +252,15 @@ class WeatherBot:
                 log.debug(f"periodic summary failed: {e}")
             self._last_summary_ts = time.time()
 
+        # Step 7: Periodic data export + disk guard (P3). Ships a dated zip of
+        # all research files then clears them so Railway's ephemeral disk can
+        # never fill and stall the bot. The disk guard runs even in continuous
+        # mode, so a full disk can no longer stop trading.
+        try:
+            self.telegram.maybe_periodic_export()
+        except Exception as _ee:
+            log.debug("periodic export failed: %s" % _ee)
+
     def _ml_prioritize_markets(self, markets):
         """Reorder markets so the ML's top-ranked cities are evaluated first.
         Ordering only — never drops a market. Safe no-op when ML / ML_SELECT_

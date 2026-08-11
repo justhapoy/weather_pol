@@ -782,6 +782,26 @@ class PositionManager:
             # in check_resolutions. (Very-bad observed legs may still be cut by the
             # STRICT thesis-exit, which itself exempts baskets.) This fixes the bug
             # where the stop-loss kept closing peak-cluster legs on a dip.
+            # P2b HARD FORCE-EXIT (wipeout guard): late_observed_no legs were
+            # riding to $0 (the -100% wipeouts) because they hold to resolution
+            # and bypass the 50% stop. If such a leg has collapsed to a near-total
+            # loss but is still sellable, cut it. Scoped to late_observed_no ONLY
+            # -- baskets / peak_cluster are never touched. Fully fail-open.
+            try:
+                if (bool(getattr(Config, 'P2B_FORCE_EXIT_ENABLED', True))
+                        and 'late_observed_no' in str(getattr(pos, 'strategy', ''))
+                        and pos.entry_price >= 0.03
+                        and pos.roi_pct <= -90.0
+                        and pos.current_price > 0.005
+                        and not pos.current_price_stale):
+                    self._close_position(pos, self._modeled_exit_price(pos, 'stop_loss'), 'stop_loss')
+                    triggered.append(pos)
+                    log.info("🧨 FORCE EXIT (wipeout guard): %s %s @ $%.4f (ROI=%.0f%%)"
+                             % (pos.city, pos.bucket_label, pos.current_price, pos.roi_pct))
+                    continue
+            except Exception:
+                pass
+
             if getattr(pos, 'hold_to_resolution', False):
                 continue
 
@@ -797,7 +817,7 @@ class PositionManager:
 
             # TAKE-PROFIT: price rose above target
             if pos.current_price >= pos.take_profit_price:
-                self._close_position(pos, pos.current_price, 'take_profit')
+                self._close_position(pos, self._modeled_exit_price(pos, 'take_profit'), 'take_profit')
                 triggered.append(pos)
                 log.info(f"🎯 TAKE PROFIT: {pos.city} {pos.bucket_label} "
                          f"@ ${pos.current_price:.4f} (entry ${pos.entry_price:.4f}) "
@@ -810,7 +830,7 @@ class PositionManager:
                 # (binary markets: either $0 or $1, no point selling at $0.002)
                 if pos.entry_price < 0.03:
                     continue  # hold to resolution for ultra-cheap
-                self._close_position(pos, pos.current_price, 'stop_loss')
+                self._close_position(pos, self._modeled_exit_price(pos, 'stop_loss'), 'stop_loss')
                 triggered.append(pos)
                 log.info(f"🛑 STOP LOSS: {pos.city} {pos.bucket_label} "
                          f"@ ${pos.current_price:.4f} (ROI={pos.roi_pct:.0f}%)")
@@ -824,7 +844,7 @@ class PositionManager:
             if pos.peak_price > pos.entry_price * min_peak_mult:
                 trail_threshold = pos.peak_price * (1 - Config.TRAILING_STOP_PCT / 100)
                 if pos.current_price < trail_threshold:
-                    self._close_position(pos, pos.current_price, 'trailing_stop')
+                    self._close_position(pos, self._modeled_exit_price(pos, 'trailing_stop'), 'trailing_stop')
                     triggered.append(pos)
                     log.info(f"📉 TRAILING STOP: {pos.city} {pos.bucket_label} "
                              f"@ ${pos.current_price:.4f} (peak=${pos.peak_price:.4f})")
@@ -833,6 +853,38 @@ class PositionManager:
             self._save_state()
             self._assert_ledger()
         return triggered
+
+    def _modeled_exit_price(self, pos, reason):
+        """P2: realistic taker fill for market EXITS ONLY (stop-loss /
+        take-profit / trailing). Applies a modeled slippage haircut to the
+        current price to emulate crossing the spread into available liquidity
+        (the liquidity-aware sell that existed but was never wired). NEVER used
+        for settlement (won/lost) -- those book at Polymarket's released price.
+        If a live CLOB order book is reachable it walks it via
+        paper_engine.simulate_taker_fill; otherwise it falls back to the
+        slippage model. Fully fail-open: any error returns the raw price.
+        """
+        try:
+            px = float(getattr(pos, 'current_price', 0.0) or 0.0)
+            if px <= 0.0 or reason in ('won', 'lost'):
+                return px
+            try:
+                client = getattr(self, '_clob_client', None)
+                if client is not None and pe is not None and getattr(pos, 'token_id', ''):
+                    ob = client.get_orderbook(pos.token_id)
+                    bids = (ob or {}).get('bids') or []
+                    ladder = [(float(b[0]), float(b[1])) for b in bids if b and float(b[0]) > 0]
+                    notional = float(getattr(pos, 'shares', 0.0) or 0.0) * px
+                    if ladder and notional > 0:
+                        fr = pe.simulate_taker_fill(ladder, notional, max_price=1.0)
+                        if fr.ok:
+                            return max(0.0, min(1.0, fr.fill_price))
+            except Exception:
+                pass
+            slip = float(getattr(Config, 'PAPER_EXIT_SLIPPAGE_PCT', 1.5) or 0.0) / 100.0
+            return max(0.0, px * (1.0 - slip))
+        except Exception:
+            return float(getattr(pos, 'current_price', 0.0) or 0.0)
 
     def _close_position(self, pos: TrackedPosition, exit_price: float, reason: str):
         """Close a position (sell or resolve)."""
@@ -1053,10 +1105,23 @@ class PositionManager:
             if resp.status_code == 200:
                 price = float(resp.json().get('price', 0))
                 if price >= 0.99:
-                    pos.redeemable = True
-                    pos.settle_source = 'clob'
-                    self._close_position(pos, 1.0, 'won')
-                    log.info(f"✅ RESOLVED WON (legacy): {pos.city} {pos.bucket_label[:30]} @ ${price:.3f}")
+                    # P1 PHANTOM GUARD: a CLOB price snapping to ~1.00 is NOT a
+                    # real settlement -- Polymarket releases the true resolved
+                    # price at/near close. golden_no was booking $1.00 "wins"
+                    # off this rail-snap (phantom wins). For golden_no we now
+                    # REFUSE to settle from the legacy CLOB path and wait for the
+                    # real resolver. Every other strategy (late_observed_no honest
+                    # holds, baskets, etc.) is untouched, so nothing else changes.
+                    _guard = bool(getattr(Config, 'PHANTOM_GUARD_GOLDEN_ONLY', True))
+                    if _guard and ('golden_no' in str(getattr(pos, 'strategy', ''))):
+                        log.info("⏸️ PHANTOM GUARD: skip legacy CLOB win for "
+                                 "golden_no %s @ $%.3f (await real resolve)"
+                                 % (pos.bucket_label[:30], price))
+                    else:
+                        pos.redeemable = True
+                        pos.settle_source = 'clob'
+                        self._close_position(pos, 1.0, 'won')
+                        log.info(f"✅ RESOLVED WON (legacy): {pos.city} {pos.bucket_label[:30]} @ ${price:.3f}")
                 elif price <= 0.01 and pos.is_expired:
                     pos.settle_source = 'clob'
                     self._close_position(pos, 0.0, 'lost')

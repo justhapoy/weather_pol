@@ -141,6 +141,18 @@ class TelegramBot:
         except Exception:
             pass
 
+    def _delete_message(self, message_id):
+        """Best-effort delete of a chat message (used to scrub a pasted ML key)."""
+        if not self.enabled or message_id is None:
+            return False
+        try:
+            r = self._session.post(self.base_url + '/deleteMessage',
+                                   json={'chat_id': self.chat_id, 'message_id': message_id},
+                                   timeout=10)
+            return r.status_code == 200
+        except Exception:
+            return False
+
     def _install_error_capture(self):
         """Attach a handler to the root logger that records WARNING+ lines into
         an in-memory ring buffer (for /aisummary). Idempotent + defensive."""
@@ -1074,6 +1086,121 @@ class TelegramBot:
             return None
 
     # ==============================================================
+    # PERIODIC EXPORT + DISK GUARD (P3) -- bundle research files into a dated
+    # zip, ship it, then delete the on-disk sources so Railway's ephemeral disk
+    # can never fill and stall the bot. Fully defensive / fail-open.
+    # ==============================================================
+    _EXPORT_PATHS = [
+        'data/paper_trades.jsonl', 'data/paper_trades.csv',
+        'data/positions_mae_mfe.jsonl', 'data/positions_mae_mfe.csv',
+        'data/positions_timeseries.jsonl', 'data/weather_trace.jsonl',
+        'data/weather_trace_observed.csv', 'data/weather_trace_fetch.csv',
+    ]
+
+    def _data_dir_mb(self):
+        """Approx size of data/ in MB (defensive)."""
+        total = 0
+        try:
+            for root, _dirs, files in os.walk('data'):
+                for fn in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, fn))
+                    except Exception:
+                        continue
+        except Exception:
+            return 0.0
+        return total / (1024.0 * 1024.0)
+
+    def _zip_and_ship_exports(self, reason='periodic', delete_after=True):
+        """Bundle all on-disk export files into ONE dated zip (dated folder
+        inside), ship it, then optionally delete the sources so they re-record
+        fresh. Returns True if a zip was sent."""
+        if not self.enabled:
+            return False
+        import zipfile as _zip
+        import glob as _glob
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')
+        folder = 'weatherpol_export_' + stamp
+        zip_path = os.path.join('data', folder + '.zip')
+        try:
+            recs = self._read_trade_log()
+            if recs:
+                self._write_trades_csv(recs)
+            self._jsonl_to_csv('data/positions_mae_mfe.jsonl')
+        except Exception:
+            pass
+        candidates = list(self._EXPORT_PATHS)
+        try:
+            candidates += sorted(_glob.glob('data/recover/recover_*.json'))
+        except Exception:
+            pass
+        present = []
+        for pth in candidates:
+            try:
+                if os.path.exists(pth) and os.path.getsize(pth) > 0:
+                    present.append(pth)
+            except Exception:
+                continue
+        if not present:
+            if reason == 'manual':
+                self.send("\u2139\uFE0F Nothing on disk to export yet.")
+            return False
+        try:
+            os.makedirs('data', exist_ok=True)
+            with _zip.ZipFile(zip_path, 'w', _zip.ZIP_DEFLATED) as zf:
+                for pth in present:
+                    zf.write(pth, arcname=os.path.join(folder, os.path.basename(pth)))
+        except Exception as e:
+            log.debug("export zip build failed: %s" % e)
+            return False
+        cap = ("\U0001F4E6 Data export (" + reason + ") -- " + str(len(present))
+               + " files, dated " + stamp + " UTC (trades, MAE/MFE, weather).")
+        sent = self._send_document(zip_path, caption=cap)
+        try:
+            os.remove(zip_path)
+        except Exception:
+            pass
+        if sent and delete_after:
+            removed = 0
+            for pth in present:
+                try:
+                    os.remove(pth)
+                    removed += 1
+                except Exception:
+                    continue
+            self.send("\U0001F5D1\uFE0F Rotated: shipped " + str(len(present))
+                      + " file(s), cleared " + str(removed)
+                      + " from disk. Fresh recording resumes now.")
+        return bool(sent)
+
+    def maybe_periodic_export(self):
+        """Scan-tick hook. Force-rotates when data/ crosses the disk guard (in
+        ANY mode -- this is what stops the crash), and on the configured hour
+        interval when EXPORT_PERIODIC_ENABLED is on. Fully defensive."""
+        if not self.enabled:
+            return
+        try:
+            import time as _time
+            guard_mb = float(getattr(Config, 'EXPORT_DISK_GUARD_MB', 400) or 0)
+            if guard_mb > 0 and self._data_dir_mb() >= guard_mb:
+                log.info("export disk guard tripped; rotating early")
+                self._zip_and_ship_exports(reason='disk-guard', delete_after=True)
+                self._last_export_ts = _time.time()
+                return
+            if not bool(getattr(Config, 'EXPORT_PERIODIC_ENABLED', False)):
+                return
+            hours = float(getattr(Config, 'EXPORT_PERIODIC_HOURS', 6) or 0)
+            if hours <= 0:
+                return
+            last = getattr(self, '_last_export_ts', 0.0)
+            if (_time.time() - last) >= hours * 3600.0:
+                self._zip_and_ship_exports(reason='periodic', delete_after=True)
+                self._last_export_ts = _time.time()
+        except Exception as e:
+            log.debug("periodic export check failed: %s" % e)
+
+
+    # ==============================================================
     # MANUAL CLOSE (/close) — list open positions with a Sell button
     # ==============================================================
 
@@ -1482,6 +1609,7 @@ class TelegramBot:
                     self._handle_document(doc)
                     continue
 
+                self._last_msg_id = msg.get('message_id')
                 self._handle_command(text)
         except Exception:
             pass
@@ -1809,6 +1937,9 @@ class TelegramBot:
         from bot import settings_store
         what = self._awaiting
         self._awaiting = None
+        if what == 'ml_key':
+            self._mlwiz_consume_key(text)
+            return
         if what == 'ml_url':
             self._mlwiz_set_url(text)
             return
@@ -1978,15 +2109,60 @@ class TelegramBot:
         )
 
     # ----- /mlsetup interactive wizard --------------------------------------
+    def _mlwiz_prompt_key(self):
+        """P4: ask the owner to paste the ML API key in chat; deleted on receipt."""
+        self._ml_wiz = {}
+        self._awaiting = 'ml_key'
+        self.send(
+            "\U0001F511 <b>ML auto-setup</b> (step 0/3 -- key)\n"
+            "Paste your <b>ML API key</b> here. I will:\n"
+            "  \u2022 delete your message immediately,\n"
+            "  \u2022 keep the key in memory only (never logged, never written to disk),\n"
+            "  \u2022 then ask for the endpoint and auto-detect + wire the models.\n\n"
+            "Send <code>cancel</code> to abort."
+        )
+
+    def _mlwiz_consume_key(self, text):
+        """P4: store the pasted key in-memory, delete the user's message, continue."""
+        try:
+            mid = getattr(self, '_last_msg_id', None)
+            if mid is not None:
+                self._delete_message(mid)
+        except Exception:
+            pass
+        raw = (text or '').strip()
+        if raw.lower() in ('cancel', 'stop', 'abort'):
+            self._ml_wiz = {}
+            self.send("\u274C ML setup cancelled. Nothing stored.")
+            return
+        if len(raw) < 8:
+            self._awaiting = 'ml_key'
+            self.send("\u26A0\uFE0F That key looks too short. Paste the full key, "
+                      "or send <code>cancel</code>.")
+            return
+        # In-memory ONLY -- never via settings_store, so it never hits
+        # runtime_settings.json. Railway env stays the canonical persistent store.
+        setattr(Config, 'ML_API_KEY', raw)
+        masked = (raw[:3] + '\u2026' + raw[-3:]) if len(raw) >= 8 else '***'
+        self.send("\u2705 Key received (<code>%s</code>) and your message was deleted. "
+                  "It stays in memory only." % self._esc(masked))
+        self._awaiting = 'ml_url'
+        cur = getattr(Config, 'ML_API_URL', '') or ''
+        self.send(
+            "\U0001F9E0 <b>ML auto-setup</b> (step 1/3 -- endpoint)\n"
+            "Now send the <b>API base URL / endpoint</b>. Examples:\n"
+            "  \u2022 <code>https://api.openai.com/v1</code>\n"
+            "  \u2022 <code>https://agentrouter.org/v1</code>\n"
+            "  \u2022 your gateway URL (Groq / Together / OpenRouter / vLLM)\n\n"
+            + ("Current: <code>%s</code>\n" % self._esc(cur) if cur else "")
+            + "Or type <code>default</code> for the provider's own base URL."
+        )
+
     def _mlwiz_start(self):
         """Step 1: require the env key, then ask for the endpoint."""
         key = getattr(Config, 'ML_API_KEY', '') or ''
         if not key:
-            self.send(
-                "\U0001F511 <b>No ML_API_KEY found.</b>\n"
-                "Set <code>ML_API_KEY</code> in your Railway env and restart, then run "
-                "<code>/mlsetup</code> again. (The key stays in env -- I never store it.)"
-            )
+            self._mlwiz_prompt_key()
             return
         self._ml_wiz = {}
         self._awaiting = 'ml_url'
@@ -2269,6 +2445,9 @@ class TelegramBot:
                         )
                 except Exception as e:
                     self.send(f"\u26A0\uFE0F ML test error: {e}")
+        elif cmd == '/mlkey':
+            # P4: fold key entry into the wizard -- prompt, delete msg, auto-detect.
+            self._mlwiz_prompt_key()
         elif cmd in ('/mlsetup', '/mlprovider', '/mlprofile'):
             # Pick the provider wire-format so the ML talks to whatever endpoint
             # you point ML_API_URL at. Usage:

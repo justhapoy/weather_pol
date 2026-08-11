@@ -194,6 +194,20 @@ class TradingExecutor:
             log.warning(f"  SKIP (zero shares): price={price:.4f} size={size_usd:.2f}")
             return None
 
+        # P2b ENTRY GATE (late_observed_no): skip entries too close to $1.00
+        # where there's no room to profit -- these caused the $0.04 churn and the
+        # worst risk/reward fills. Scoped to late_observed_no; fail-open.
+        try:
+            if 'late_observed_no' in str(strategy):
+                ceiling = float(getattr(Config, 'P2B_ENTRY_CEILING', 0.90) or 0.99)
+                min_room = float(getattr(Config, 'P2B_MIN_ROOM_USD', 0.10) or 0.0)
+                if price > ceiling or (1.0 - price) < min_room:
+                    log.info("  SKIP (P2b entry gate): %s price=%.3f ceiling=%.3f room=%.3f<min=%.3f"
+                             % (bucket_label, price, ceiling, 1.0 - price, min_room))
+                    return None
+        except Exception:
+            pass
+
         # ── 3. position limits ──
         open_pos = self.get_open_positions()
         pending = self.get_pending_order_count()

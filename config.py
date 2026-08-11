@@ -111,7 +111,7 @@ class Config:
     # which the null-tolerant helpers already handle; temperature is solid.
     OPEN_METEO_MODELS = [m.strip() for m in os.getenv(
         'OPEN_METEO_MODELS',
-        'ecmwf_ifs,ecmwf_ifs025,gfs_seamless,icon_seamless,jma_seamless,gem_seamless,ecmwf_ifs04'
+        'ecmwf_ifs,ecmwf_ifs025,gfs_seamless,icon_seamless,jma_seamless,gem_seamless'
     ).split(',') if m.strip()]
 
     # ===================================================================
