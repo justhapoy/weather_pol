@@ -260,6 +260,11 @@ class WeatherBot:
             self.telegram.maybe_periodic_export()
         except Exception as _ee:
             log.debug("periodic export failed: %s" % _ee)
+        try:
+            from data import vps_store
+            vps_store.maybe_offload()
+        except Exception as _ve:
+            log.debug("vps offload skip: %s" % _ve)
 
     def _ml_prioritize_markets(self, markets):
         """Reorder markets so the ML's top-ranked cities are evaluated first.

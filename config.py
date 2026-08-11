@@ -133,6 +133,30 @@ class Config:
     # Extra Open-Meteo mirror endpoints used as failover ONLY when the primary
     # endpoints are cooling down (comma-sep; supplements OPEN_METEO_ENDPOINTS).
     OPEN_METEO_FAILOVER_ENDPOINTS = [e.strip() for e in os.getenv('OPEN_METEO_FAILOVER_ENDPOINTS', '').split(',') if e.strip()]
+    # -- VPS Edge Node (weather proxy + data store) -----------------------
+    # When VPS_BASE_URL is set the bot routes Open-Meteo through the VPS
+    # (fast, self-warming cache) and AUTOMATICALLY keeps DIRECT Open-Meteo as
+    # a failover, so if the proxy is offline the bot silently falls back to
+    # normal Railway->Open-Meteo polling. The token is sent ONLY to the VPS.
+    VPS_BASE_URL = os.getenv('VPS_BASE_URL', '').strip().rstrip('/')
+    VPS_AUTH_TOKEN = os.getenv('VPS_AUTH_TOKEN', '') or os.getenv('PROXY_AUTH_TOKEN', '')
+    VPS_FORECAST_PATH = os.getenv('VPS_FORECAST_PATH', '/v1/forecast')
+    VPS_TIMEOUT_SECONDS = float(os.getenv('VPS_TIMEOUT_SECONDS', '8'))
+    VPS_OFFLOAD_ENABLED = os.getenv('VPS_OFFLOAD_ENABLED', '0') == '1'
+    VPS_OFFLOAD_INTERVAL_HOURS = float(os.getenv('VPS_OFFLOAD_INTERVAL_HOURS', '12'))
+    VPS_OFFLOAD_BATCH_LINES = int(os.getenv('VPS_OFFLOAD_BATCH_LINES', '2000'))
+    if VPS_BASE_URL:
+        _vps_forecast = VPS_BASE_URL + VPS_FORECAST_PATH
+        _eps = [_vps_forecast]
+        for _e in OPEN_METEO_ENDPOINTS:
+            if _e != _vps_forecast:
+                _eps.append(_e)
+        OPEN_METEO_ENDPOINTS = _eps
+        _direct = 'https://api.open-meteo.com/v1/forecast'
+        _fbs = list(OPEN_METEO_FAILOVER_ENDPOINTS)
+        if (_direct not in OPEN_METEO_ENDPOINTS) and (_direct not in _fbs):
+            _fbs.append(_direct)
+        OPEN_METEO_FAILOVER_ENDPOINTS = _fbs
 
     # WEATHER-DATA BUY GUARD (Req-30) - NEVER place a buy without enough live
     # weather data. fetch_all() returns nothing when every provider failed / is
@@ -746,7 +770,7 @@ class Config:
     # ===================================================================
     # LOGGING
     # ===================================================================
-    LOG_FILE = os.getenv('LOG_FILE', 'weather_bot.log')
+    LOG_FILE = os.getenv('LOG_FILE', 'data/weather_bot.log')
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
 
     # ===================================================================

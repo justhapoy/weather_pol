@@ -175,6 +175,16 @@ def _open_meteo_endpoints() -> List[str]:
     return eps
 
 
+def _proxy_headers(url: str) -> Dict:
+    """Bearer token ONLY for our VPS proxy; never sent to public Open-Meteo."""
+    c = _config()
+    base = (getattr(c, "VPS_BASE_URL", "") or "") if c is not None else ""
+    tok = (getattr(c, "VPS_AUTH_TOKEN", "") or "") if c is not None else ""
+    if base and tok and url.startswith(base):
+        return {"Authorization": "Bearer " + tok}
+    return {}
+
+
 @dataclass
 class ObservedDayState:
     """Snapshot of a single local measurement day, mid-day."""
@@ -255,7 +265,7 @@ class ObservedWeather:
             log.warning(f"requests unavailable, cannot fetch observed weather: {e}")
             return None
         try:
-            resp = requests.get(url, params=params, timeout=self.timeout)
+            resp = requests.get(url, params=params, timeout=self.timeout, headers=_proxy_headers(url))
             if resp.status_code != 200:
                 # Open-Meteo returns a JSON body like {"error": true,
                 # "reason": "..."} on 400 — surface it instead of silent None.
@@ -327,7 +337,7 @@ class ObservedWeather:
                 log.warning("\u26a0\ufe0f  All Open-Meteo endpoints are cooling down — observed weather unavailable")
                 return None
             try:
-                resp = requests.get(url, params=params, timeout=self.timeout)
+                resp = requests.get(url, params=params, timeout=self.timeout, headers=_proxy_headers(url))
             except Exception as e:
                 log.warning(f"\u26a0\ufe0f  observed-weather fetch failed ({url}): {e}")
                 continue  # transient — try the next mirror without cooling it

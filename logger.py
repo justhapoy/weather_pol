@@ -73,7 +73,8 @@ def setup_logger(name: str = 'weather_bot', log_file: str = None) -> logging.Log
     log_path = log_file or Config.LOG_FILE
     try:
         os.makedirs(os.path.dirname(log_path) if os.path.dirname(log_path) else '.', exist_ok=True)
-        fh = logging.FileHandler(log_path, encoding='utf-8')
+        from logging.handlers import RotatingFileHandler
+        fh = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter(
             '[%(asctime)s] [%(levelname)-5s] %(name)s — %(message)s'

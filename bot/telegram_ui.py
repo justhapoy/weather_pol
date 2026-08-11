@@ -2109,6 +2109,69 @@ class TelegramBot:
         )
 
     # ----- /mlsetup interactive wizard --------------------------------------
+    def _handle_vps_command(self, cmd):
+        """VPS edge-node status + pull commands. Fast: the node serves counters
+        from RAM. All fail-open so a down VPS never breaks the bot."""
+        try:
+            from data import vps_store
+        except Exception as e:
+            self.send("VPS client unavailable: %s" % e); return
+        if not vps_store.configured():
+            self.send("\u26a0\ufe0f VPS not configured. Set VPS_BASE_URL + VPS_AUTH_TOKEN in Railway env."); return
+        try:
+            if cmd == '/vpshealth':
+                h = vps_store.health()
+                if not h.get('ok'):
+                    self.send("\U0001f534 VPS unreachable: %s" % h.get('error', 'no response')); return
+                up = int(h.get('uptime_s', 0) or 0)
+                self.send("\U0001f7e2 VPS up\nversion: %s\nuptime: %dh %dm\nround-trip: %s ms" % (
+                    h.get('version', '?'), up // 3600, (up % 3600) // 60, h.get('latency_ms', '?')))
+            elif cmd == '/vpsweather':
+                m = vps_store.metrics()
+                if not m.get('ok'):
+                    self.send("\U0001f534 VPS metrics unavailable: %s" % m.get('error', '')); return
+                w = m.get('weather', {})
+                self.send("\U0001f326\ufe0f VPS weather\npolls ok/fail: %s/%s\nlast poll: %ss ago\nfresh models: %s\nsilent: %s\ncache hit rate: %s%%" % (
+                    w.get('polls_ok', '?'), w.get('polls_fail', '?'), w.get('last_poll_age_s', '?'),
+                    ', '.join(w.get('fresh_models', []) or []) or '-',
+                    ', '.join(w.get('silent_models', []) or []) or '-',
+                    w.get('cache_hit_rate', '?')))
+            elif cmd == '/vpsstorage':
+                u = vps_store.usage()
+                if not u.get('ok'):
+                    self.send("\U0001f534 VPS storage unavailable: %s" % u.get('error', '')); return
+                streams = u.get('streams', {}) or {}
+                sflat = ', '.join(("%s(%s)" % (k, v)) for k, v in streams.items()) or '-'
+                self.send("\U0001f4be VPS storage\nused: %s MB / %s MB (%s%% free)\nrecords: %s\noldest: %s\nstreams: %s" % (
+                    u.get('used_mb', '?'), u.get('total_mb', '?'), u.get('free_pct', '?'),
+                    u.get('records', '?'), u.get('oldest', '-'), sflat))
+            elif cmd == '/vpsstats':
+                m = vps_store.metrics()
+                if not m.get('ok'):
+                    self.send("\U0001f534 VPS stats unavailable: %s" % m.get('error', '')); return
+                reqs = m.get('requests', {}) or {}
+                rflat = ', '.join(("%s=%s" % (k, v)) for k, v in reqs.items()) or '-'
+                self.send("\U0001f4ca VPS stats\ntotal requests: %s\nby route: %s\ncache hit rate: %s%%\noffload enabled: %s" % (
+                    m.get('requests_total', '?'), rflat,
+                    (m.get('weather', {}) or {}).get('cache_hit_rate', '?'),
+                    getattr(Config, 'VPS_OFFLOAD_ENABLED', False)))
+            elif cmd == '/vpspull':
+                self.send("\u2b07\ufe0f Pulling stored data bundle from the VPS ...")
+                res = vps_store.pull_bundle()
+                if not res.get('ok'):
+                    self.send("\U0001f534 Pull failed: %s" % res.get('error', '')); return
+                path = res.get('path')
+                if path and os.path.exists(path):
+                    self._send_document(path, caption="\U0001f4e6 VPS data bundle (%s)" % res.get('size_h', ''))
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+                else:
+                    self.send("\u2139\ufe0f VPS reported no stored data to pull.")
+        except Exception as e:
+            self.send("VPS command failed: %s" % e)
+
     def _mlwiz_prompt_key(self):
         """P4: ask the owner to paste the ML API key in chat; deleted on receipt."""
         self._ml_wiz = {}
@@ -2448,6 +2511,8 @@ class TelegramBot:
         elif cmd == '/mlkey':
             # P4: fold key entry into the wizard -- prompt, delete msg, auto-detect.
             self._mlwiz_prompt_key()
+        elif cmd in ('/vpshealth', '/vpsweather', '/vpsstorage', '/vpsstats', '/vpspull'):
+            self._handle_vps_command(cmd)
         elif cmd in ('/mlsetup', '/mlprovider', '/mlprofile'):
             # Pick the provider wire-format so the ML talks to whatever endpoint
             # you point ML_API_URL at. Usage:

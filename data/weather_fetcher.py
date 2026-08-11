@@ -117,6 +117,15 @@ class WeatherFetcher:
                 return url
         return None
 
+    def _proxy_headers(self, url: str) -> dict:
+        """Attach the bearer token ONLY when the request goes to our VPS proxy
+        (never to the public Open-Meteo endpoint or other providers)."""
+        base = getattr(Config, 'VPS_BASE_URL', '') or ''
+        tok = getattr(Config, 'VPS_AUTH_TOKEN', '') or ''
+        if base and tok and url.startswith(base):
+            return {'Authorization': 'Bearer ' + tok}
+        return {}
+
     def _open_meteo_request(self, params: dict) -> Optional[dict]:
         """GET an Open-Meteo forecast, transparently failing over across endpoints
         on a rate/IP limit (HTTP status in Config.WEATHER_RATELIMIT_STATUS, or a
@@ -133,7 +142,7 @@ class WeatherFetcher:
                 log.warning("⚠️  All Open-Meteo endpoints are cooling down — using other sources")
                 return None
             try:
-                resp = self.session.get(url, params=params, timeout=10)
+                resp = self.session.get(url, params=params, timeout=10, headers=self._proxy_headers(url))
             except Exception as e:
                 log.debug(f"Open-Meteo request error ({url}): {e}")
                 continue  # transient — try the next mirror without cooling it

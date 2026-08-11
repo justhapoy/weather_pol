@@ -47,6 +47,9 @@ _NEW_DEFAULTS = {
     'GOLDEN_EDGE_MIN': float(os.getenv('GOLDEN_EDGE_MIN', '0.10')),
     'GOLDEN_EDGE_MAX': float(os.getenv('GOLDEN_EDGE_MAX', '0.50')),
     'GOLDEN_GRADE_MAX': float(os.getenv('GOLDEN_GRADE_MAX', '0.90')),
+    'VPS_OFFLOAD_ENABLED': os.getenv('VPS_OFFLOAD_ENABLED', '0') == '1',
+    'VPS_OFFLOAD_INTERVAL_HOURS': float(os.getenv('VPS_OFFLOAD_INTERVAL_HOURS', '12')),
+    'VPS_OFFLOAD_BATCH_LINES': int(os.getenv('VPS_OFFLOAD_BATCH_LINES', '2000')),
 }
 for _k, _v in _NEW_DEFAULTS.items():
     if not hasattr(Config, _k):
@@ -95,6 +98,8 @@ BOOL_KEYS = [
     'EXPORT_PERIODIC_ENABLED',
     'P2B_FORCE_EXIT_ENABLED', 'PHANTOM_GUARD_GOLDEN_ONLY',
     'GOLDEN_NO_SAMEDAY_ENABLED',
+    # VPS edge-node data offload
+    'VPS_OFFLOAD_ENABLED',
 ]
 
 # -- Numeric gates: key -> (min, max, step, is_int) ---------------------
@@ -234,6 +239,9 @@ NUM_KEYS: Dict[str, tuple] = {
     'GOLDEN_EDGE_MIN':              (0.00, 0.50, 0.01, False),
     'GOLDEN_EDGE_MAX':              (0.00, 0.90, 0.01, False),
     'GOLDEN_GRADE_MAX':             (0.00, 1.00, 0.05, False),
+    # VPS edge-node data offload
+    'VPS_OFFLOAD_INTERVAL_HOURS':   (1, 48, 1, False),
+    'VPS_OFFLOAD_BATCH_LINES':      (200, 20000, 200, True),
 }
 
 # -- String/choice settings: key -> list of allowed values (first = default) --
@@ -368,6 +376,9 @@ GROUPS: List[dict] = [
     {'id': 'p2btune', 'tab': 'Observed-No fix', 'title': 'Late-observed-no WR->profit + fill model', 'keys': [
         'P2B_ENTRY_CEILING', 'P2B_MIN_ROOM_USD', 'P2B_FORCE_EXIT_ENABLED',
         'PAPER_EXIT_SLIPPAGE_PCT', 'PHANTOM_GUARD_GOLDEN_ONLY',
+    ]},
+    {'id': 'vps', 'tab': 'VPS', 'title': 'VPS edge-node data offload', 'keys': [
+        'VPS_OFFLOAD_ENABLED', 'VPS_OFFLOAD_INTERVAL_HOURS', 'VPS_OFFLOAD_BATCH_LINES',
     ]},
 ]
 
