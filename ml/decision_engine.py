@@ -440,11 +440,26 @@ class MLDecisionEngine:
             self._last_error = r['error']
             if r['error'] == 'timeout':
                 log.warning(f"  ML API TIMEOUT [{self._api_failures}] - using local model")
+                try:
+                    from data import notifier as _ntf
+                    _ntf.note_ml_status(False, "timeout")
+                except Exception:
+                    pass
                 return self._local_fallback('BUY', 'API timeout')
             log.warning(f"  ML API FAIL [{self._api_failures}]: {self._last_error}")
+            try:
+                from data import notifier as _ntf
+                _ntf.note_ml_status(False, str(self._last_error)[:60])
+            except Exception:
+                pass
             return self._local_fallback('BUY', f"API {str(r['error'])[:30]}")
         self._total_tokens_used += r['tokens']
         self._last_ok_ts = time.time()
+        try:
+            from data import notifier as _ntf
+            _ntf.note_ml_status(True)
+        except Exception:
+            pass
         return self._parse_response(r['content'] or '{}')
 
     def _local_fallback(self, default_action: str, reason: str) -> dict:

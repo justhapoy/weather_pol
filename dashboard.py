@@ -93,6 +93,13 @@ class WeatherBot:
         self.station_resolver = StationResolver()
         self.resolution_verifier = ResolutionVerifier() if ResolutionVerifier else None
         self.telegram = TelegramBot(position_manager=self.pm, scanner=self.scanner)
+        # Wire the lightweight event notifier -> Telegram (proxy<->direct switch,
+        # VPS health/offload, ML status). In-memory only; see data/notifier.py.
+        try:
+            from data import notifier as _notifier
+            _notifier.bind(self.telegram.send)
+        except Exception as _ne:
+            log.debug(f"notifier bind failed: {_ne}")
         # Req-30: give Telegram the ML engine so /mlanalysis writes a real report.
         try:
             self.telegram.attach_ml(self.ml)

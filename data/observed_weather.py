@@ -280,6 +280,11 @@ class ObservedWeather:
                     f"models={params.get('models', '-')} \u2014 {body}"
                 )
                 return None
+            try:
+                from data import notifier as _ntf
+                _ntf.note_weather_source(url)
+            except Exception:
+                pass
             return resp.json()
         except Exception as e:
             log.warning(f"\u26a0\ufe0f  observed-weather fetch failed: {e}")
@@ -302,6 +307,11 @@ class ObservedWeather:
             return
         cd = _cooldown_seconds()
         self._om_cooldowns[url] = time.time() + cd
+        try:
+            from data import notifier as _ntf
+            _ntf.note_endpoint_cooldown(url, reason)
+        except Exception:
+            pass
         log.warning(f"\u26a0\ufe0f  observed-weather endpoint cooling {cd}s ({url}) {reason}".rstrip())
 
     def _next_open_meteo_url(self) -> Optional[str]:
@@ -340,6 +350,11 @@ class ObservedWeather:
                 resp = requests.get(url, params=params, timeout=self.timeout, headers=_proxy_headers(url))
             except Exception as e:
                 log.warning(f"\u26a0\ufe0f  observed-weather fetch failed ({url}): {e}")
+                try:
+                    from data import notifier as _ntf
+                    _ntf.note_endpoint_error(url, e)
+                except Exception:
+                    pass
                 continue  # transient — try the next mirror without cooling it
 
             if resp.status_code in ratelimit_status:

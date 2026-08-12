@@ -85,6 +85,14 @@ def _get(path, params=None, stream=False, timeout=None):
                  timeout=(timeout or _timeout()), stream=stream)
 
 
+def _notify_health(ok, detail=""):
+    try:
+        from data import notifier as _ntf
+        _ntf.note_vps_health(ok, detail)
+    except Exception:
+        pass
+
+
 def health():
     if not configured():
         return {"ok": False, "error": "not configured"}
@@ -97,8 +105,10 @@ def health():
         d = resp.json() or {}
         d["ok"] = True
         d["latency_ms"] = dt
+        _notify_health(True, "%s ms" % dt)
         return d
     except Exception as e:
+        _notify_health(False, str(e)[:60])
         return {"ok": False, "error": str(e)}
 
 
@@ -212,6 +222,11 @@ def maybe_offload():
         n = sum((res.get("shipped") or {}).values())
         if n:
             log.info("VPS offload: shipped %d records, cleared local disk." % n)
+            try:
+                from data import notifier as _ntf
+                _ntf.note_vps_offload("%d records across %d streams" % (n, len(res.get("shipped") or {})))
+            except Exception:
+                pass
     except Exception:
         pass
 

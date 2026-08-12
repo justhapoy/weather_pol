@@ -50,6 +50,11 @@ _NEW_DEFAULTS = {
     'VPS_OFFLOAD_ENABLED': os.getenv('VPS_OFFLOAD_ENABLED', '0') == '1',
     'VPS_OFFLOAD_INTERVAL_HOURS': float(os.getenv('VPS_OFFLOAD_INTERVAL_HOURS', '12')),
     'VPS_OFFLOAD_BATCH_LINES': int(os.getenv('VPS_OFFLOAD_BATCH_LINES', '2000')),
+    'NOTIFY_WEATHER_SOURCE': os.getenv('NOTIFY_WEATHER_SOURCE', '1') == '1',
+    'NOTIFY_VPS_HEALTH': os.getenv('NOTIFY_VPS_HEALTH', '1') == '1',
+    'NOTIFY_VPS_OFFLOAD': os.getenv('NOTIFY_VPS_OFFLOAD', '1') == '1',
+    'NOTIFY_ENDPOINT_COOLDOWN': os.getenv('NOTIFY_ENDPOINT_COOLDOWN', '0') == '1',
+    'NOTIFY_ML_STATUS': os.getenv('NOTIFY_ML_STATUS', '0') == '1',
 }
 for _k, _v in _NEW_DEFAULTS.items():
     if not hasattr(Config, _k):
@@ -100,6 +105,9 @@ BOOL_KEYS = [
     'GOLDEN_NO_SAMEDAY_ENABLED',
     # VPS edge-node data offload
     'VPS_OFFLOAD_ENABLED',
+    # Telegram event notifications (state-change only, rate-limited)
+    'NOTIFY_WEATHER_SOURCE', 'NOTIFY_VPS_HEALTH', 'NOTIFY_VPS_OFFLOAD',
+    'NOTIFY_ENDPOINT_COOLDOWN', 'NOTIFY_ML_STATUS',
 ]
 
 # -- Numeric gates: key -> (min, max, step, is_int) ---------------------
@@ -379,6 +387,10 @@ GROUPS: List[dict] = [
     ]},
     {'id': 'vps', 'tab': 'VPS', 'title': 'VPS edge-node data offload', 'keys': [
         'VPS_OFFLOAD_ENABLED', 'VPS_OFFLOAD_INTERVAL_HOURS', 'VPS_OFFLOAD_BATCH_LINES',
+    ]},
+    {'id': 'notify', 'tab': 'Notifications', 'title': 'Telegram event notifications (state-change only, rate-limited, no disk logs)', 'keys': [
+        'NOTIFY_WEATHER_SOURCE', 'NOTIFY_VPS_HEALTH', 'NOTIFY_VPS_OFFLOAD',
+        'NOTIFY_ENDPOINT_COOLDOWN', 'NOTIFY_ML_STATUS',
     ]},
 ]
 

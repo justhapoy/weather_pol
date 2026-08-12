@@ -103,6 +103,11 @@ class WeatherFetcher:
             return
         cd = int(getattr(Config, 'WEATHER_PROVIDER_COOLDOWN_SECONDS', 600))
         self._om_cooldowns[url] = time.time() + cd
+        try:
+            from data import notifier as _ntf
+            _ntf.note_endpoint_cooldown(url, reason)
+        except Exception:
+            pass
         log.warning(f"⚠️  Open-Meteo endpoint cooling {cd}s ({url}) {reason}".rstrip())
 
     def _next_open_meteo_url(self) -> Optional[str]:
@@ -145,6 +150,11 @@ class WeatherFetcher:
                 resp = self.session.get(url, params=params, timeout=10, headers=self._proxy_headers(url))
             except Exception as e:
                 log.debug(f"Open-Meteo request error ({url}): {e}")
+                try:
+                    from data import notifier as _ntf
+                    _ntf.note_endpoint_error(url, e)
+                except Exception:
+                    pass
                 continue  # transient — try the next mirror without cooling it
 
             if resp.status_code in ratelimit_status:
@@ -169,6 +179,11 @@ class WeatherFetcher:
                 log.debug(f"Open-Meteo error ({url}): {reason}")
                 return None
 
+            try:
+                from data import notifier as _ntf
+                _ntf.note_weather_source(url)
+            except Exception:
+                pass
             return data
 
         return None

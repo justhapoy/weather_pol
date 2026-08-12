@@ -2169,8 +2169,63 @@ class TelegramBot:
                         pass
                 else:
                     self.send("\u2139\ufe0f VPS reported no stored data to pull.")
+            elif cmd == '/vpscheck':
+                self._vps_full_check()
         except Exception as e:
             self.send("VPS command failed: %s" % e)
+
+    def _vps_full_check(self):
+        # One-shot 'does everything work?' rollup: reachability, weather
+        # polls, storage headroom, offload config + an 'update needed?' verdict.
+        from data import vps_store
+        lines = ["\U0001f9ea <b>VPS full check</b>"]
+        todo = []
+        h = vps_store.health()
+        if h.get('ok'):
+            lines.append("\u2705 reachable (%s ms, v%s)" % (h.get('latency_ms', '?'), h.get('version', '?')))
+            try:
+                if int(h.get('latency_ms', 0) or 0) > 1500:
+                    todo.append("High round-trip (>1.5s): node under load -> raise threads or check network.")
+            except Exception:
+                pass
+        else:
+            lines.append("\U0001f534 NOT reachable: %s" % h.get('error', '?'))
+            todo.append("Open TCP 8080 (provider firewall + ufw); confirm the container is up; then re-run /vpscheck.")
+        m = vps_store.metrics()
+        if m.get('ok'):
+            w = m.get('weather', {}) or {}
+            lines.append("\U0001f326\ufe0f polls ok/fail: %s/%s | cache hit: %s%%" % (w.get('polls_ok', '?'), w.get('polls_fail', '?'), w.get('cache_hit_rate', '?')))
+            silent = w.get('silent_models', []) or []
+            if silent:
+                lines.append("\u26a0\ufe0f silent models: %s" % ', '.join(silent))
+                todo.append("Silent models (%s) return no data -> remove from OPEN_METEO_MODELS." % ', '.join(silent))
+            try:
+                if int(w.get('polls_fail', 0) or 0) > int(w.get('polls_ok', 0) or 0):
+                    todo.append("More failed polls than good -> check upstream key/limit or raise OM_TIMEOUT_SECONDS.")
+            except Exception:
+                pass
+        else:
+            lines.append("\u26a0\ufe0f metrics unavailable: %s" % m.get('error', ''))
+        u = vps_store.usage()
+        if u.get('ok'):
+            lines.append("\U0001f4be storage: %s/%s MB (%s%% free)" % (u.get('used_mb', '?'), u.get('total_mb', '?'), u.get('free_pct', '?')))
+            try:
+                if float(u.get('free_pct', 100) or 100) < 10:
+                    todo.append("Storage under 10% free -> pull a bundle (/vpspull) or raise STORE_MAX_MB.")
+            except Exception:
+                pass
+        else:
+            lines.append("\u2139\ufe0f storage: %s" % u.get('error', ''))
+        lines.append("\u2699\ufe0f offload: %s (every %sh, %s lines/batch)" % ('ON' if getattr(Config, 'VPS_OFFLOAD_ENABLED', False) else 'OFF', getattr(Config, 'VPS_OFFLOAD_INTERVAL_HOURS', '?'), getattr(Config, 'VPS_OFFLOAD_BATCH_LINES', '?')))
+        if todo:
+            lines.append("")
+            lines.append("\U0001f527 <b>Updates needed:</b>")
+            for _i, _t in enumerate(todo, 1):
+                lines.append("%d. %s" % (_i, _t))
+        else:
+            lines.append("")
+            lines.append("\u2705 All checks passed \u2014 no updates needed.")
+        self.send("\n".join(lines))
 
     def _mlwiz_prompt_key(self):
         """P4: ask the owner to paste the ML API key in chat; deleted on receipt."""
@@ -2511,7 +2566,7 @@ class TelegramBot:
         elif cmd == '/mlkey':
             # P4: fold key entry into the wizard -- prompt, delete msg, auto-detect.
             self._mlwiz_prompt_key()
-        elif cmd in ('/vpshealth', '/vpsweather', '/vpsstorage', '/vpsstats', '/vpspull'):
+        elif cmd in ('/vpshealth', '/vpsweather', '/vpsstorage', '/vpsstats', '/vpspull', '/vpscheck'):
             self._handle_vps_command(cmd)
         elif cmd in ('/mlsetup', '/mlprovider', '/mlprofile'):
             # Pick the provider wire-format so the ML talks to whatever endpoint
@@ -2680,6 +2735,12 @@ class TelegramBot:
                 "/reserve [USD] — view/set untouchable cash reserve\n"
                 "/takeout [USD|withdraw] — set win-skim target / withdraw the pool\n"
                 "/info KEY — explain any setting (effect + range)\n"
+                "/vpshealth — VPS up + round-trip latency\n"
+                "/vpsweather — VPS weather polls + cache hit rate\n"
+                "/vpsstorage — VPS stored data + disk headroom\n"
+                "/vpsstats — VPS request counters\n"
+                "/vpspull — download stored data bundle from the VPS\n"
+                "/vpscheck — full VPS check + what needs fixing\n"
                 "/help — this message"
             )
         elif cmd.startswith('/'):
